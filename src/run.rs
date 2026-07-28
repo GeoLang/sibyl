@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
@@ -245,6 +247,14 @@ where
     Ok(!turn.tool_calls.is_empty())
 }
 
+/// the names the model was actually offered, so salvage can refuse anything else
+fn tool_names(tools: &[Value]) -> HashSet<&str> {
+    tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect()
+}
+
 const SUMMARY_INSTRUCTION: &str = "Summarize the conversation below into a compact briefing. \
 Preserve dataset names, file paths, key results, and open threads. Keep it factual, no preamble.";
 
@@ -262,6 +272,7 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
         Ok(tools) => tools,
         Err(err) => return sink.fail(err).await,
     };
+    let names = tool_names(&tools);
 
     for _ in 0..MAX_MODEL_CALLS {
         let messages = match assemble(&state.db, session_id, &req.system_prompt, |older| {
@@ -276,6 +287,7 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
             Ok(turn) => turn,
             Err(err) => return sink.fail(err).await,
         };
+        let turn = crate::salvage::salvage_turn(turn, &names);
         let executor = |name: String, args: String| {
             let catalog = state.catalog.clone();
             async move { catalog.execute(&name, &args).await }

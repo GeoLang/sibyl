@@ -1,6 +1,7 @@
 mod db;
 mod llm;
 mod run;
+mod salvage;
 mod sessions;
 mod tools;
 

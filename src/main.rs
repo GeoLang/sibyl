@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, patch, post};
@@ -28,8 +28,31 @@ pub struct AppState {
     pub run_lock: Arc<Mutex<()>>,
 }
 
+const DEFAULT_API_BASE: &str = "https://api.x.ai/v1";
+
+/// compose files pass unset vars through as `${VAR:-}`, so an empty or blank
+/// value has to mean unset or it silently blanks a default
+fn present(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_var(key: &str) -> Option<String> {
+    present(std::env::var(key).ok())
+}
+
 fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    env_var(key).unwrap_or_else(|| default.to_string())
+}
+
+/// x.ai always needs a key, so keep forgetting it a startup failure there. a base
+/// the operator pointed elsewhere may be a keyless local server.
+fn resolve_api_key(api_base: &str, api_key: Option<String>) -> Result<Option<String>> {
+    if api_key.is_none() && api_base == DEFAULT_API_BASE {
+        bail!("XAI_API_KEY must be set to reach {DEFAULT_API_BASE}");
+    }
+    Ok(api_key)
 }
 
 #[tokio::main]
@@ -43,9 +66,14 @@ async fn main() -> Result<()> {
         .parse()
         .context("SIBYL_PORT must be a port number")?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
-    let api_key = std::env::var("XAI_API_KEY").context("XAI_API_KEY must be set")?;
     let model = env_or("SIBYL_MODEL", "grok-4-1-fast-reasoning");
-    let api_base = env_or("SIBYL_API_BASE", "https://api.x.ai/v1");
+    let api_base = env_or("SIBYL_API_BASE", DEFAULT_API_BASE)
+        .trim_end_matches('/')
+        .to_string();
+    let api_key = resolve_api_key(&api_base, env_var("XAI_API_KEY"))?;
+    if api_key.is_none() {
+        info!("no XAI_API_KEY set, calling {api_base} without authentication");
+    }
     let geolang_url = env_or("GEOLANG_URL", "http://geolang-api:8080");
     let tool_timeout = Duration::from_secs(
         env_or("SIBYL_TOOL_TIMEOUT_SECS", "600")
@@ -60,7 +88,7 @@ async fn main() -> Result<()> {
         db: Arc::new(Db::open(&db_path)?),
         llm: Arc::new(llm::Client::new(
             http.clone(),
-            api_base.trim_end_matches('/').to_string(),
+            api_base,
             api_key,
             model.clone(),
         )),
@@ -97,4 +125,50 @@ async fn main() -> Result<()> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_env_values_fall_back_to_the_default() {
+        for blank in ["", "  ", "\n"] {
+            assert_eq!(
+                present(Some(blank.to_string())).unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
+                DEFAULT_API_BASE
+            );
+        }
+        assert_eq!(present(None), None);
+        assert_eq!(
+            present(Some(" http://127.0.0.1:8080/v1 \n".into())).as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+    }
+
+    #[test]
+    fn the_cloud_base_still_demands_a_key() {
+        assert!(resolve_api_key(DEFAULT_API_BASE, None).is_err());
+        assert_eq!(
+            resolve_api_key(DEFAULT_API_BASE, Some("xai-secret".into())).unwrap(),
+            Some("xai-secret".into())
+        );
+    }
+
+    #[test]
+    fn a_custom_base_may_run_keyless() {
+        let local = "http://127.0.0.1:18099/v1";
+        assert_eq!(resolve_api_key(local, None).unwrap(), None);
+        assert_eq!(
+            resolve_api_key(local, Some("local".into())).unwrap(),
+            Some("local".into())
+        );
+    }
+
+    /// a trailing slash must not sneak past the cloud check and drop the key requirement
+    #[test]
+    fn a_trailing_slash_is_still_the_cloud_base() {
+        let normalized = "https://api.x.ai/v1/".trim_end_matches('/');
+        assert!(resolve_api_key(normalized, None).is_err());
+    }
 }

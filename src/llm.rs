@@ -84,7 +84,24 @@ struct ChatResponse {
 
 #[derive(Debug, Deserialize)]
 struct Choice {
-    message: ChatMessage,
+    message: ResponseMessage,
+}
+
+/// the assistant message as servers actually send it back, kept separate from
+/// `ChatMessage` because llama-server adds `reasoning_content` and sends an
+/// empty content string next to tool calls
+#[derive(Debug, Deserialize)]
+struct ResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.trim().is_empty())
 }
 
 /// parse a chat-completions body into the first choice's turn
@@ -94,25 +111,33 @@ pub fn parse_turn(body: &str) -> Result<Turn> {
     let Some(choice) = parsed.choices.into_iter().next() else {
         bail!("model returned no choices");
     };
-    let text = choice
-        .message
-        .content
-        .filter(|content| !content.trim().is_empty());
-    Ok(Turn {
-        text,
-        tool_calls: choice.message.tool_calls.unwrap_or_default(),
-    })
+    let message = choice.message;
+    let tool_calls = message.tool_calls.unwrap_or_default();
+    let text = match non_blank(message.content) {
+        Some(text) => Some(text),
+        // a thinking model that spent its whole budget on thoughts leaves content
+        // empty, so fall back to the thoughts rather than reporting nothing at all
+        None if tool_calls.is_empty() => non_blank(message.reasoning_content),
+        None => None,
+    };
+    Ok(Turn { text, tool_calls })
 }
 
 pub struct Client {
     http: reqwest::Client,
     api_base: String,
-    api_key: String,
+    /// none when running against a keyless server, no auth header is sent then
+    api_key: Option<String>,
     model: String,
 }
 
 impl Client {
-    pub fn new(http: reqwest::Client, api_base: String, api_key: String, model: String) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        api_base: String,
+        api_key: Option<String>,
+        model: String,
+    ) -> Self {
         Self {
             http,
             api_base,
@@ -130,19 +155,101 @@ impl Client {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
         }
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}/chat/completions", self.api_base))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("calling the model")?;
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.context("calling the model")?;
         let status = response.status();
         let text = response.text().await.context("reading model response")?;
         if !status.is_success() {
             bail!("model returned {status}: {}", text.trim());
         }
         parse_turn(&text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// llama-server b10052 answering without tools: real content plus the thoughts
+    /// it split out into reasoning_content, and no tool_calls key at all
+    #[test]
+    fn parses_llama_server_text_response() {
+        let body = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{
+            "role":"assistant","content":"PONG",
+            "reasoning_content":"The user is asking for a specific word.\n"}}],
+            "model":"/models/Qwen3.5-9B-Q4_K_M.gguf","object":"chat.completion",
+            "system_fingerprint":"b10052-b2dd28a3b"}"#;
+        let turn = parse_turn(body).expect("parses");
+        assert_eq!(turn.text.as_deref(), Some("PONG"));
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    /// llama-server sends an empty content string next to tool_calls, and puts the
+    /// id after the function object. x.ai sends null content and no reasoning.
+    #[test]
+    fn parses_llama_server_tool_call_with_empty_content() {
+        let body = r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{
+            "role":"assistant","content":"",
+            "reasoning_content":"I should call get_weather with Paris.\n",
+            "tool_calls":[{"type":"function","function":{
+                "name":"get_weather","arguments":"{\"city\":\"Paris\"}"},
+                "id":"KpuUpnfE7rnh4OJlomSmc9sWEl7ffQa2"}]}}]}"#;
+        let turn = parse_turn(body).expect("parses");
+        assert_eq!(turn.text, None, "thoughts must not become assistant text");
+        assert_eq!(
+            turn.tool_calls,
+            vec![ToolCall {
+                id: "KpuUpnfE7rnh4OJlomSmc9sWEl7ffQa2".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Paris"}"#.into(),
+                },
+            }]
+        );
+    }
+
+    /// a thinking model can burn its whole budget before writing any content,
+    /// which would otherwise make the run finish with nothing to show
+    #[test]
+    fn falls_back_to_reasoning_when_nothing_else_came_back() {
+        let body = r#"{"choices":[{"finish_reason":"length","index":0,"message":{
+            "role":"assistant","content":"",
+            "reasoning_content":"Thinking Process:\n1. Analyze the request"}}]}"#;
+        let turn = parse_turn(body).expect("parses");
+        assert_eq!(
+            turn.text.as_deref(),
+            Some("Thinking Process:\n1. Analyze the request")
+        );
+    }
+
+    /// the cloud shape stays exactly as it was: null content beside tool calls
+    #[test]
+    fn parses_cloud_tool_call_with_null_content() {
+        let body = r#"{"choices":[{"index":0,"finish_reason":"tool_calls","message":{
+            "role":"assistant","content":null,
+            "tool_calls":[{"id":"call_123","type":"function","function":{
+                "name":"list_datasets","arguments":"{}"}}]}}]}"#;
+        let turn = parse_turn(body).expect("parses");
+        assert_eq!(turn.text, None);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.name, "list_datasets");
+    }
+
+    #[test]
+    fn blank_response_yields_an_empty_turn() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"  "}}]}"#;
+        assert_eq!(parse_turn(body).expect("parses"), Turn::default());
+    }
+
+    #[test]
+    fn no_choices_is_an_error() {
+        assert!(parse_turn(r#"{"choices":[]}"#).is_err());
     }
 }

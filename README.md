@@ -14,10 +14,23 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | `SIBYL_API_BASE` | `https://api.x.ai/v1` | trailing slash is stripped |
 | `GEOLANG_URL` | `http://geolang-api:8080` | tool manifest and executor |
 | `SIBYL_TOOL_TIMEOUT_SECS` | `600` | per tool call |
+| `SIBYL_MAX_MODEL_CALLS` | `30` | model calls per run |
+| `SIBYL_RUN_BUDGET_SECS` | `900` | wall clock per run |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank the base URL or the model.
 
-`XAI_API_KEY` is required while `SIBYL_API_BASE` is the default x.ai endpoint, and startup fails without it. Point `SIBYL_API_BASE` at another server and the key becomes optional: with no key sibyl sends no `Authorization` header and logs one line saying so. If you do set a key alongside a custom base, it goes to that host, so only point sibyl at servers you trust.
+### Model profiles
+
+sibyl builds two profiles at startup and you switch between them at runtime.
+
+- **cloud**, the default x.ai endpoint, available only when `XAI_API_KEY` is set.
+- **local**, `SIBYL_API_BASE` and `SIBYL_MODEL`, available only when `SIBYL_API_BASE` names something other than the x.ai URL.
+
+Set both and you get both, with local active by default. Set only one and sibyl behaves as it always has, including failing at startup when neither works out, which keeps a forgotten key loud. `SIBYL_MODEL` names the local model when a local base is configured, and the cloud model otherwise.
+
+The active profile is stored in sqlite and survives a restart. A stored choice that is no longer available, say the key was pulled, falls back to whatever is available rather than starting broken.
+
+A local profile with no key sends no `Authorization` header and logs one line saying so. A key set alongside a custom base still goes to that host, so only point sibyl at servers you trust.
 
 ## Run
 
@@ -68,8 +81,14 @@ Keep system prompts explicit about when to call what, keep tool schemas small, a
 - `PATCH /sessions/{id}` `{"name"}` renames
 - `DELETE /sessions/{id}` deletes, 400 if active
 - `POST /sessions/{id}/messages` `{"content"}` appends a user message without running the model
+- `GET /models` `{"active", "profiles":[{"id","label","model","available"}]}`
+- `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable
 - `POST /runs` `{"system_prompt","message"}` runs the agent loop against the active session, NDJSON stream
 
-Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`.
+These endpoints are unauthenticated, like the rest of sibyl's API, which already exposes run execution: put it behind something that authenticates.
+
+A switch applies to the next run. A run already going finishes on the profile it started with.
+
+Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`. A run that hits `SIBYL_MAX_MODEL_CALLS` or `SIBYL_RUN_BUDGET_SECS` ends with an `error` event naming which one it was.
 
 The tool manifest comes from `GET {GEOLANG_URL}/tools` and is cached for 60 seconds, tool calls go to `POST {GEOLANG_URL}/tools/{name}` with `{"args": {...}}` and read back `.result`.

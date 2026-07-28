@@ -108,7 +108,11 @@ impl Db {
                 name TEXT,
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS messages_session_idx ON messages(session_id, id);",
+            CREATE INDEX IF NOT EXISTS messages_session_idx ON messages(session_id, id);
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -257,6 +261,27 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn get_config(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn()
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -288,6 +313,11 @@ pub mod testing {
                 .join(format!("{}.db", uuid::Uuid::new_v4()));
             let db = Db::open(&path).expect("opening temp db");
             Self { db, path }
+        }
+
+        /// opens the same file again, standing in for a restart
+        pub fn reopen(&self) -> Db {
+            Db::open(&self.path).expect("reopening temp db")
         }
     }
 
@@ -384,6 +414,22 @@ mod tests {
         let after = temp.db.messages_after(&session.id, second).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].content.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn config_survives_a_restart() {
+        let temp = TempDb::new();
+        assert_eq!(temp.db.get_config("active_model").unwrap(), None);
+
+        temp.db.set_config("active_model", "local").unwrap();
+        temp.db.set_config("active_model", "cloud").unwrap();
+
+        let restarted = temp.reopen();
+        assert_eq!(
+            restarted.get_config("active_model").unwrap().as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(restarted.get_config("missing").unwrap(), None);
     }
 
     #[test]

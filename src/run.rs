@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::Json;
@@ -15,9 +16,10 @@ use tracing::warn;
 
 use crate::AppState;
 use crate::db::{Db, NewMessage, StoredMessage};
-use crate::llm::{ChatMessage, ToolCall, Turn, estimated_tokens};
+use crate::llm::{ChatMessage, Client, ToolCall, Turn, estimated_tokens};
 
-pub const MAX_MODEL_CALLS: usize = 30;
+pub const DEFAULT_MAX_MODEL_CALLS: usize = 30;
+pub const DEFAULT_RUN_BUDGET_SECS: u64 = 900;
 pub const SUMMARIZE_THRESHOLD_TOKENS: usize = 100_000;
 pub const KEEP_RECENT_MESSAGES: usize = 20;
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 20_000;
@@ -71,6 +73,52 @@ impl EventSink {
 pub struct RunRequest {
     pub system_prompt: String,
     pub message: String,
+}
+
+/// per-run ceilings, both operator-tunable. the wall clock one exists because a
+/// slow local model can burn a long time without ever reaching the call cap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunLimits {
+    pub max_model_calls: usize,
+    pub budget: Duration,
+}
+
+impl Default for RunLimits {
+    fn default() -> Self {
+        Self {
+            max_model_calls: DEFAULT_MAX_MODEL_CALLS,
+            budget: Duration::from_secs(DEFAULT_RUN_BUDGET_SECS),
+        }
+    }
+}
+
+/// which ceiling a run hit, so the error event can say which one
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Exhausted {
+    Calls(usize),
+    Time(u64),
+}
+
+impl std::fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exhausted::Calls(calls) => write!(f, "run exceeded {calls} model calls"),
+            Exhausted::Time(secs) => write!(f, "run exceeded its {secs}s time budget"),
+        }
+    }
+}
+
+impl RunLimits {
+    /// checked between model calls, never mid-call
+    pub fn exhausted(&self, calls: usize, elapsed: Duration) -> Option<Exhausted> {
+        if calls >= self.max_model_calls {
+            Some(Exhausted::Calls(self.max_model_calls))
+        } else if elapsed >= self.budget {
+            Some(Exhausted::Time(self.budget.as_secs()))
+        } else {
+            None
+        }
+    }
 }
 
 pub fn truncate_tool_output(output: &str) -> String {
@@ -258,12 +306,12 @@ fn tool_names(tools: &[Value]) -> HashSet<&str> {
 const SUMMARY_INSTRUCTION: &str = "Summarize the conversation below into a compact briefing. \
 Preserve dataset names, file paths, key results, and open threads. Keep it factual, no preamble.";
 
-async fn summarize_with_model(state: &AppState, older: Vec<ChatMessage>) -> Result<String> {
+async fn summarize_with_model(client: &Client, older: Vec<ChatMessage>) -> Result<String> {
     let messages = vec![
         ChatMessage::system(SUMMARY_INSTRUCTION),
         ChatMessage::user(flatten_for_summary(&older)),
     ];
-    let turn = state.llm.chat(&messages, &[]).await?;
+    let turn = client.chat(&messages, &[]).await?;
     turn.text.context("summarizer returned no text")
 }
 
@@ -273,17 +321,25 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
         Err(err) => return sink.fail(err).await,
     };
     let names = tool_names(&tools);
+    // captured once, so switching profiles mid-run cannot swap the client underneath
+    let client = state.models.active_client();
+    let started = Instant::now();
+    let mut calls = 0;
 
-    for _ in 0..MAX_MODEL_CALLS {
+    loop {
+        if let Some(exhausted) = state.limits.exhausted(calls, started.elapsed()) {
+            return sink.fail(exhausted).await;
+        }
+        calls += 1;
         let messages = match assemble(&state.db, session_id, &req.system_prompt, |older| {
-            summarize_with_model(state, older)
+            summarize_with_model(&client, older)
         })
         .await
         {
             Ok(messages) => messages,
             Err(err) => return sink.fail(err).await,
         };
-        let turn = match state.llm.chat(&messages, &tools).await {
+        let turn = match client.chat(&messages, &tools).await {
             Ok(turn) => turn,
             Err(err) => return sink.fail(err).await,
         };
@@ -298,8 +354,6 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
             Err(err) => return sink.fail(err).await,
         }
     }
-    sink.fail(format!("run exceeded {MAX_MODEL_CALLS} model calls"))
-        .await;
 }
 
 pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
@@ -360,6 +414,61 @@ mod tests {
             events.push(serde_json::from_str(line.trim_end()).expect("event json"));
         }
         events
+    }
+
+    #[test]
+    fn the_call_cap_trips_before_the_time_budget() {
+        let limits = RunLimits {
+            max_model_calls: 3,
+            budget: Duration::from_secs(900),
+        };
+        assert_eq!(limits.exhausted(0, Duration::ZERO), None);
+        assert_eq!(limits.exhausted(2, Duration::from_secs(899)), None);
+        assert_eq!(
+            limits.exhausted(3, Duration::ZERO),
+            Some(Exhausted::Calls(3))
+        );
+    }
+
+    #[test]
+    fn the_time_budget_trips_while_calls_are_still_spare() {
+        let limits = RunLimits {
+            max_model_calls: 30,
+            budget: Duration::from_secs(120),
+        };
+        assert_eq!(limits.exhausted(1, Duration::from_secs(119)), None);
+        assert_eq!(
+            limits.exhausted(1, Duration::from_secs(120)),
+            Some(Exhausted::Time(120))
+        );
+    }
+
+    #[test]
+    fn each_budget_names_itself() {
+        assert_eq!(
+            Exhausted::Calls(30).to_string(),
+            "run exceeded 30 model calls"
+        );
+        assert_eq!(
+            Exhausted::Time(900).to_string(),
+            "run exceeded its 900s time budget"
+        );
+    }
+
+    /// the ui only sees the stream, so a tripped budget must arrive as an error event
+    #[tokio::test]
+    async fn a_tripped_budget_ends_the_stream_with_an_error_event() {
+        let (sink, rx) = sink_and_events();
+        sink.fail(Exhausted::Time(120)).await;
+        assert_eq!(
+            drain(sink, rx).await,
+            vec![
+                Event::Error {
+                    message: "run exceeded its 120s time budget".into()
+                },
+                Event::Done,
+            ]
+        );
     }
 
     #[test]

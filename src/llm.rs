@@ -146,6 +146,10 @@ impl Client {
         }
     }
 
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<Turn> {
         let mut body = serde_json::json!({
             "model": self.model,

@@ -1,35 +1,38 @@
 mod db;
 mod llm;
+mod models;
 mod run;
 mod salvage;
 mod sessions;
 mod tools;
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::db::Db;
+use crate::models::{ACTIVE_KEY, DEFAULT_MODEL, Models};
+use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
 use crate::tools::ToolCatalog;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
-    pub llm: Arc<llm::Client>,
+    pub models: Arc<Models>,
     pub catalog: Arc<ToolCatalog>,
+    pub limits: RunLimits,
     pub run_lock: Arc<Mutex<()>>,
 }
-
-const DEFAULT_API_BASE: &str = "https://api.x.ai/v1";
 
 /// compose files pass unset vars through as `${VAR:-}`, so an empty or blank
 /// value has to mean unset or it silently blanks a default
@@ -47,13 +50,25 @@ fn env_or(key: &str, default: &str) -> String {
     env_var(key).unwrap_or_else(|| default.to_string())
 }
 
-/// x.ai always needs a key, so keep forgetting it a startup failure there. a base
-/// the operator pointed elsewhere may be a keyless local server.
-fn resolve_api_key(api_base: &str, api_key: Option<String>) -> Result<Option<String>> {
-    if api_key.is_none() && api_base == DEFAULT_API_BASE {
-        bail!("XAI_API_KEY must be set to reach {DEFAULT_API_BASE}");
+fn parse_or<T>(key: &str, raw: Option<String>, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    match raw {
+        Some(raw) => raw
+            .parse()
+            .map_err(|err| anyhow::anyhow!("{key} must be a number: {err}")),
+        None => Ok(default),
     }
-    Ok(api_key)
+}
+
+fn env_parsed<T>(key: &str, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    parse_or(key, env_var(key), default)
 }
 
 #[tokio::main]
@@ -63,41 +78,42 @@ async fn main() -> Result<()> {
         .init();
 
     let host = env_or("SIBYL_HOST", "0.0.0.0");
-    let port: u16 = env_or("SIBYL_PORT", "8090")
-        .parse()
-        .context("SIBYL_PORT must be a port number")?;
+    let port: u16 = env_parsed("SIBYL_PORT", 8090)?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
-    let model = env_or("SIBYL_MODEL", "grok-4-1-fast-reasoning");
-    let api_base = env_or("SIBYL_API_BASE", DEFAULT_API_BASE)
-        .trim_end_matches('/')
-        .to_string();
-    let api_key = resolve_api_key(&api_base, env_var("XAI_API_KEY"))?;
-    if api_key.is_none() {
-        info!("no XAI_API_KEY set, calling {api_base} without authentication");
+    let model = env_or("SIBYL_MODEL", DEFAULT_MODEL);
+    let api_base = env_var("SIBYL_API_BASE").map(|base| base.trim_end_matches('/').to_string());
+    let specs = models::specs(env_var("XAI_API_KEY"), api_base, model)?;
+    if specs.cloud.is_none() {
+        info!("no XAI_API_KEY set, the cloud profile is unavailable");
+    }
+    if let Some(local) = specs.local.as_ref().filter(|local| local.key.is_none()) {
+        info!("local profile calls {} without authentication", local.base);
     }
     let geolang_url = env_or("GEOLANG_URL", "http://geolang-api:8080");
-    let tool_timeout = Duration::from_secs(
-        env_or("SIBYL_TOOL_TIMEOUT_SECS", "600")
-            .parse()
-            .context("SIBYL_TOOL_TIMEOUT_SECS must be a number of seconds")?,
-    );
+    let tool_timeout = Duration::from_secs(env_parsed("SIBYL_TOOL_TIMEOUT_SECS", 600u64)?);
+    let limits = RunLimits {
+        max_model_calls: env_parsed("SIBYL_MAX_MODEL_CALLS", DEFAULT_MAX_MODEL_CALLS)?,
+        budget: Duration::from_secs(env_parsed(
+            "SIBYL_RUN_BUDGET_SECS",
+            DEFAULT_RUN_BUDGET_SECS,
+        )?),
+    };
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
+    let db = Db::open(&db_path)?;
+    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?);
+    let active = models.active_label();
     let state = AppState {
-        db: Arc::new(Db::open(&db_path)?),
-        llm: Arc::new(llm::Client::new(
-            http.clone(),
-            api_base,
-            api_key,
-            model.clone(),
-        )),
+        db: Arc::new(db),
+        models: Arc::new(models),
         catalog: Arc::new(ToolCatalog::new(
             http,
             geolang_url.trim_end_matches('/').to_string(),
             tool_timeout,
         )),
+        limits,
         run_lock: Arc::new(Mutex::new(())),
     };
 
@@ -110,6 +126,8 @@ async fn main() -> Result<()> {
         )
         .route("/sessions/{id}/activate", post(sessions::activate))
         .route("/sessions/{id}/messages", post(sessions::add_message))
+        .route("/models", get(models::list))
+        .route("/model", put(models::switch))
         .route("/runs", post(run::post_run))
         .with_state(state);
 
@@ -117,7 +135,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {host}:{port}"))?;
     info!(
-        "sibyl listening on {host}:{port}, model {model}, db {}",
+        "sibyl listening on {host}:{port}, active profile {active}, db {}",
         db_path.display()
     );
     axum::serve(listener, app).await?;
@@ -135,10 +153,7 @@ mod tests {
     #[test]
     fn blank_env_values_fall_back_to_the_default() {
         for blank in ["", "  ", "\n"] {
-            assert_eq!(
-                present(Some(blank.to_string())).unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
-                DEFAULT_API_BASE
-            );
+            assert_eq!(present(Some(blank.to_string())), None, "blank {blank:?}");
         }
         assert_eq!(present(None), None);
         assert_eq!(
@@ -147,29 +162,40 @@ mod tests {
         );
     }
 
+    /// the two run knobs share the blank-is-unset handling of every other var
     #[test]
-    fn the_cloud_base_still_demands_a_key() {
-        assert!(resolve_api_key(DEFAULT_API_BASE, None).is_err());
+    fn the_run_knobs_fall_back_when_unset_or_blank() {
         assert_eq!(
-            resolve_api_key(DEFAULT_API_BASE, Some("xai-secret".into())).unwrap(),
-            Some("xai-secret".into())
+            parse_or("SIBYL_MAX_MODEL_CALLS", None, DEFAULT_MAX_MODEL_CALLS).unwrap(),
+            DEFAULT_MAX_MODEL_CALLS
+        );
+        assert_eq!(
+            parse_or("SIBYL_MAX_MODEL_CALLS", present(Some("  ".into())), 30usize).unwrap(),
+            30
+        );
+        assert_eq!(
+            parse_or(
+                "SIBYL_MAX_MODEL_CALLS",
+                Some("4".into()),
+                DEFAULT_MAX_MODEL_CALLS
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            parse_or(
+                "SIBYL_RUN_BUDGET_SECS",
+                Some("120".into()),
+                DEFAULT_RUN_BUDGET_SECS
+            )
+            .unwrap(),
+            120
         );
     }
 
     #[test]
-    fn a_custom_base_may_run_keyless() {
-        let local = "http://127.0.0.1:18099/v1";
-        assert_eq!(resolve_api_key(local, None).unwrap(), None);
-        assert_eq!(
-            resolve_api_key(local, Some("local".into())).unwrap(),
-            Some("local".into())
-        );
-    }
-
-    /// a trailing slash must not sneak past the cloud check and drop the key requirement
-    #[test]
-    fn a_trailing_slash_is_still_the_cloud_base() {
-        let normalized = "https://api.x.ai/v1/".trim_end_matches('/');
-        assert!(resolve_api_key(normalized, None).is_err());
+    fn a_non_numeric_knob_names_itself_in_the_error() {
+        let err = parse_or("SIBYL_RUN_BUDGET_SECS", Some("soon".into()), 900u64).unwrap_err();
+        assert!(err.to_string().contains("SIBYL_RUN_BUDGET_SECS"));
     }
 }

@@ -48,8 +48,9 @@ pub fn specs(key: Option<String>, base: Option<String>, model: String) -> Result
         .map(|base| Spec {
             base,
             model: model.clone(),
-            // the key follows a custom base exactly as it did before profiles existed
-            key: key.clone(),
+            // never forward the cloud key to a local server. an authenticated
+            // alternate provider would need its own key config, not this one
+            key: None,
         });
     let cloud = key.map(|key| Spec {
         base: DEFAULT_API_BASE.to_string(),
@@ -310,6 +311,9 @@ mod tests {
         // SIBYL_MODEL went to the local server, so cloud falls back to its default
         assert_eq!(specs.cloud.as_ref().unwrap().model, DEFAULT_MODEL);
         assert_eq!(specs.cloud.as_ref().unwrap().base, DEFAULT_API_BASE);
+        // the cloud key must never ride along to the local server
+        assert_eq!(specs.local.as_ref().unwrap().key, None);
+        assert!(specs.cloud.as_ref().unwrap().key.is_some());
     }
 
     /// a trailing slash must not read as a custom base and invent a local profile

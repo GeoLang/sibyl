@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
@@ -57,6 +61,11 @@ impl EventSink {
         let mut line = serde_json::to_string(&event).expect("event serialization");
         line.push('\n');
         let _ = self.0.send(Ok(line)).await;
+    }
+
+    /// true once the client stopped reading, which drops the receiving half
+    pub fn disconnected(&self) -> bool {
+        self.0.is_closed()
     }
 
     async fn fail(&self, message: impl std::fmt::Display) {
@@ -315,44 +324,118 @@ async fn summarize_with_model(client: &Client, older: Vec<ChatMessage>) -> Resul
     turn.text.context("summarizer returned no text")
 }
 
+/// everything one run needs that is not a call out to the model or a tool
+struct Cycle<'a> {
+    db: &'a Db,
+    session_id: &'a str,
+    system_prompt: &'a str,
+    limits: RunLimits,
+    names: &'a HashSet<&'a str>,
+    sink: &'a EventSink,
+}
+
+impl Cycle<'_> {
+    /// the agent loop, with the model and tool calls injected so tests can count
+    /// model calls and cut the client off partway through
+    async fn drive<M, MFut, S, SFut, E, EFut>(&self, call_model: M, summarize: S, execute: E)
+    where
+        M: Fn(Vec<ChatMessage>) -> MFut,
+        MFut: Future<Output = Result<Turn>>,
+        S: Fn(Vec<ChatMessage>) -> SFut,
+        SFut: Future<Output = Result<String>>,
+        E: Fn(String, String) -> EFut,
+        EFut: Future<Output = String>,
+    {
+        let started = Instant::now();
+        let mut calls = 0;
+
+        loop {
+            // nobody is reading, so another model call would only burn tokens
+            if self.sink.disconnected() {
+                warn!("client left, stopping the run after {calls} model calls");
+                return;
+            }
+            if let Some(exhausted) = self.limits.exhausted(calls, started.elapsed()) {
+                return self.sink.fail(exhausted).await;
+            }
+            calls += 1;
+            let messages =
+                match assemble(self.db, self.session_id, self.system_prompt, &summarize).await {
+                    Ok(messages) => messages,
+                    Err(err) => return self.sink.fail(err).await,
+                };
+            let turn = match call_model(messages).await {
+                Ok(turn) => turn,
+                Err(err) => return self.sink.fail(err).await,
+            };
+            let turn = crate::salvage::salvage_turn(turn, self.names);
+            match execute_turn(self.db, self.session_id, &turn, &execute, self.sink).await {
+                Ok(true) => continue,
+                Ok(false) => return self.sink.send(Event::Done).await,
+                Err(err) => return self.sink.fail(err).await,
+            }
+        }
+    }
+}
+
 async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: &EventSink) {
     let tools = match state.catalog.tools().await {
         Ok(tools) => tools,
         Err(err) => return sink.fail(err).await,
     };
+    let tools = Arc::new(tools);
     let names = tool_names(&tools);
     // captured once, so switching profiles mid-run cannot swap the client underneath
     let client = state.models.active_client();
-    let started = Instant::now();
-    let mut calls = 0;
 
-    loop {
-        if let Some(exhausted) = state.limits.exhausted(calls, started.elapsed()) {
-            return sink.fail(exhausted).await;
-        }
-        calls += 1;
-        let messages = match assemble(&state.db, session_id, &req.system_prompt, |older| {
-            summarize_with_model(&client, older)
-        })
-        .await
-        {
-            Ok(messages) => messages,
-            Err(err) => return sink.fail(err).await,
-        };
-        let turn = match client.chat(&messages, &tools).await {
-            Ok(turn) => turn,
-            Err(err) => return sink.fail(err).await,
-        };
-        let turn = crate::salvage::salvage_turn(turn, &names);
-        let executor = |name: String, args: String| {
-            let catalog = state.catalog.clone();
-            async move { catalog.execute(&name, &args).await }
-        };
-        match execute_turn(&state.db, session_id, &turn, executor, sink).await {
-            Ok(true) => continue,
-            Ok(false) => return sink.send(Event::Done).await,
-            Err(err) => return sink.fail(err).await,
-        }
+    let cycle = Cycle {
+        db: &state.db,
+        session_id,
+        system_prompt: &req.system_prompt,
+        limits: state.limits,
+        names: &names,
+        sink,
+    };
+    cycle
+        .drive(
+            |messages| {
+                let client = client.clone();
+                let tools = tools.clone();
+                async move { client.chat(&messages, &tools).await }
+            },
+            |older| {
+                let client = client.clone();
+                async move { summarize_with_model(&client, older).await }
+            },
+            |name, args| {
+                let catalog = state.catalog.clone();
+                async move { catalog.execute(&name, &args).await }
+            },
+        )
+        .await;
+}
+
+/// kills the run task when the response body is dropped. a client disconnect
+/// drops the body, and dropping the task drops the in-flight model request, so
+/// the server stops generating instead of finishing an answer nobody wants.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct GuardedStream {
+    inner: ReceiverStream<Result<String, Infallible>>,
+    _guard: AbortOnDrop,
+}
+
+impl Stream for GuardedStream {
+    type Item = Result<String, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -360,7 +443,7 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
     let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(64);
     let sink = EventSink::new(tx);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _guard = state.run_lock.clone().lock_owned().await;
         let session = match state.db.active_session() {
             Ok(Some(session)) => Some(session),
@@ -388,7 +471,10 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
 
     (
         [(header::CONTENT_TYPE, "application/x-ndjson")],
-        Body::from_stream(ReceiverStream::new(rx)),
+        Body::from_stream(GuardedStream {
+            inner: ReceiverStream::new(rx),
+            _guard: AbortOnDrop(task),
+        }),
     )
         .into_response()
 }
@@ -397,7 +483,19 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
 mod tests {
     use super::*;
     use crate::db::testing::TempDb;
-    use crate::llm::parse_turn;
+    use crate::llm::FunctionCall;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
 
     fn sink_and_events() -> (EventSink, mpsc::Receiver<Result<String, Infallible>>) {
         let (tx, rx) = mpsc::channel(64);
@@ -414,6 +512,103 @@ mod tests {
             events.push(serde_json::from_str(line.trim_end()).expect("event json"));
         }
         events
+    }
+
+    #[tokio::test]
+    async fn the_sink_notices_the_client_leaving() {
+        let (sink, rx) = sink_and_events();
+        assert!(!sink.disconnected());
+        drop(rx);
+        assert!(sink.disconnected());
+    }
+
+    /// the viewer's abort button drops the ndjson stream. the loop must not keep
+    /// calling the model after that, which is what burned minutes of generation.
+    #[tokio::test]
+    async fn a_client_that_leaves_stops_the_run_before_the_next_model_call() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat").unwrap();
+        let (sink, rx) = sink_and_events();
+        let names: HashSet<&str> = ["echo"].into_iter().collect();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(std::sync::Mutex::new(Some(rx)));
+        let cycle = Cycle {
+            db: &temp.db,
+            session_id: &session.id,
+            system_prompt: "you are a test",
+            limits: RunLimits::default(),
+            names: &names,
+            sink: &sink,
+        };
+
+        cycle
+            .drive(
+                |_messages| {
+                    let calls = calls.clone();
+                    let client = client.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // the viewer goes away while the model is answering
+                        client.lock().expect("client mutex").take();
+                        // a tool call, so the loop would otherwise come round again
+                        Ok(Turn {
+                            text: None,
+                            tool_calls: vec![call("c1", "echo", "{}")],
+                        })
+                    }
+                },
+                |_older| async { unreachable!("history is too short to summarize") },
+                |_name, _args| async { "echoed".to_string() },
+            )
+            .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the loop kept calling the model after the client left"
+        );
+    }
+
+    /// the same loop keeps going while the client is still reading
+    #[tokio::test]
+    async fn a_connected_client_runs_until_the_call_cap() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat").unwrap();
+        let (sink, _rx) = sink_and_events();
+        let names: HashSet<&str> = ["echo"].into_iter().collect();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cycle = Cycle {
+            db: &temp.db,
+            session_id: &session.id,
+            system_prompt: "you are a test",
+            limits: RunLimits {
+                max_model_calls: 3,
+                budget: Duration::from_secs(900),
+            },
+            names: &names,
+            sink: &sink,
+        };
+
+        cycle
+            .drive(
+                |_messages| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(Turn {
+                            text: None,
+                            tool_calls: vec![call("c1", "echo", "{}")],
+                        })
+                    }
+                },
+                |_older| async { unreachable!("history is too short to summarize") },
+                |_name, _args| async { "echoed".to_string() },
+            )
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -486,10 +681,10 @@ mod tests {
     async fn content_only_response_emits_one_text_event() {
         let temp = TempDb::new();
         let session = temp.db.create_session("chat").unwrap();
-        let turn = parse_turn(
-            r#"{"choices":[{"message":{"role":"assistant","content":"all done","tool_calls":null}}]}"#,
-        )
-        .unwrap();
+        let turn = Turn {
+            text: Some("all done".into()),
+            tool_calls: Vec::new(),
+        };
 
         let (sink, rx) = sink_and_events();
         let more = execute_turn(
@@ -519,13 +714,13 @@ mod tests {
     async fn tool_calls_emit_call_then_return_in_order() {
         let temp = TempDb::new();
         let session = temp.db.create_session("chat").unwrap();
-        let turn = parse_turn(
-            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
-                {"id":"c1","type":"function","function":{"name":"list_files","arguments":"{\"path\":\"/data\"}"}},
-                {"id":"c2","type":"function","function":{"name":"stat","arguments":"{}"}}
-            ]}}]}"#,
-        )
-        .unwrap();
+        let turn = Turn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "list_files", r#"{"path":"/data"}"#),
+                call("c2", "stat", "{}"),
+            ],
+        };
 
         let (sink, rx) = sink_and_events();
         let more = execute_turn(
@@ -578,12 +773,10 @@ mod tests {
     async fn mixed_response_emits_text_before_tool_events() {
         let temp = TempDb::new();
         let session = temp.db.create_session("chat").unwrap();
-        let turn = parse_turn(
-            r#"{"choices":[{"message":{"role":"assistant","content":"looking it up","tool_calls":[
-                {"id":"c1","type":"function","function":{"name":"search","arguments":"{\"q\":\"roads\"}"}}
-            ]}}]}"#,
-        )
-        .unwrap();
+        let turn = Turn {
+            text: Some("looking it up".into()),
+            tool_calls: vec![call("c1", "search", r#"{"q":"roads"}"#)],
+        };
 
         let (sink, rx) = sink_and_events();
         execute_turn(

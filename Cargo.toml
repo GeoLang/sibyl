@@ -11,7 +11,7 @@ description = "LLM agent loop microservice with HTTP tool dispatch"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

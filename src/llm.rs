@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
@@ -77,50 +79,163 @@ pub struct Turn {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// ceilings on what a streamed response may make us allocate
+const MAX_STREAM_TOOL_CALLS: usize = 64;
+const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    /// llama-server can report a failure mid-stream, after a 200
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Choice {
-    message: ResponseMessage,
+struct StreamChoice {
+    #[serde(default)]
+    delta: Delta,
 }
 
-/// the assistant message as servers actually send it back, kept separate from
-/// `ChatMessage` because llama-server adds `reasoning_content` and sends an
-/// empty content string next to tool calls
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
+/// one streamed slice of the assistant message. llama-server sends `content` as
+/// an explicit null on the opening chunk, splits thinking into
+/// `reasoning_content`, and dribbles tool arguments across many chunks.
+#[derive(Debug, Default, Deserialize)]
+struct Delta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<ToolCall>>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
-fn non_blank(value: Option<String>) -> Option<String> {
-    value.filter(|text| !text.trim().is_empty())
+#[derive(Debug, Deserialize)]
+struct ToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FunctionDelta>,
 }
 
-/// parse a chat-completions body into the first choice's turn
-pub fn parse_turn(body: &str) -> Result<Turn> {
-    let parsed: ChatResponse =
-        serde_json::from_str(body).context("decoding chat completions response")?;
-    let Some(choice) = parsed.choices.into_iter().next() else {
-        bail!("model returned no choices");
-    };
-    let message = choice.message;
-    let tool_calls = message.tool_calls.unwrap_or_default();
-    let text = match non_blank(message.content) {
-        Some(text) => Some(text),
-        // a thinking model that spent its whole budget on thoughts leaves content
-        // empty, so fall back to the thoughts rather than reporting nothing at all
-        None if tool_calls.is_empty() => non_blank(message.reasoning_content),
-        None => None,
-    };
-    Ok(Turn { text, tool_calls })
+#[derive(Debug, Deserialize)]
+struct FunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PartialCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+fn non_blank(value: String) -> Option<String> {
+    Some(value).filter(|text| !text.trim().is_empty())
+}
+
+/// collects sse chunks into the one turn the loop acts on
+#[derive(Debug, Default)]
+pub struct StreamAccumulator {
+    content: String,
+    reasoning: String,
+    calls: Vec<PartialCall>,
+}
+
+impl StreamAccumulator {
+    /// feeds one raw sse line, returning false once the stream says it is done
+    pub fn push(&mut self, line: &str) -> Result<bool> {
+        let Some(data) = line.trim_end().strip_prefix("data:") else {
+            // blank separators and comment lines carry nothing
+            return Ok(true);
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return Ok(false);
+        }
+        let chunk: StreamChunk =
+            serde_json::from_str(data).context("decoding a chat completions chunk")?;
+        if let Some(error) = chunk.error {
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_string);
+            bail!("model stream failed: {detail}");
+        }
+        for choice in chunk.choices {
+            self.apply(choice.delta)?;
+        }
+        Ok(true)
+    }
+
+    fn apply(&mut self, delta: Delta) -> Result<()> {
+        if let Some(content) = delta.content {
+            self.content.push_str(&content);
+        }
+        if let Some(reasoning) = delta.reasoning_content {
+            self.reasoning.push_str(&reasoning);
+        }
+        for call in delta.tool_calls.unwrap_or_default() {
+            // a chunk without an index continues the call already in flight
+            let index = call
+                .index
+                .unwrap_or_else(|| self.calls.len().saturating_sub(1));
+            if index >= MAX_STREAM_TOOL_CALLS {
+                bail!("model streamed more than {MAX_STREAM_TOOL_CALLS} tool calls");
+            }
+            if self.calls.len() <= index {
+                self.calls.resize_with(index + 1, PartialCall::default);
+            }
+            let slot = &mut self.calls[index];
+            if let Some(id) = call.id {
+                slot.id = id;
+            }
+            if let Some(function) = call.function {
+                if let Some(name) = function.name {
+                    slot.name = name;
+                }
+                if let Some(arguments) = function.arguments {
+                    slot.arguments.push_str(&arguments);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Turn {
+        let tool_calls: Vec<ToolCall> = self
+            .calls
+            .into_iter()
+            // a call that never got a name cannot be dispatched anywhere
+            .filter(|call| !call.name.is_empty())
+            .map(|call| ToolCall {
+                id: if call.id.is_empty() {
+                    format!("stream_{}", Uuid::new_v4())
+                } else {
+                    call.id
+                },
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: call.name,
+                    arguments: call.arguments,
+                },
+            })
+            .collect();
+        let text = match non_blank(self.content) {
+            Some(text) => Some(text),
+            // a thinking model that spent its whole budget on thoughts leaves content
+            // empty, so fall back to the thoughts rather than reporting nothing at all
+            None if tool_calls.is_empty() => non_blank(self.reasoning),
+            None => None,
+        };
+        Turn { text, tool_calls }
+    }
 }
 
 pub struct Client {
@@ -150,11 +265,14 @@ impl Client {
         &self.model
     }
 
+    /// streams the completion and accumulates it server side. streaming is what
+    /// lets a dropped run stop generation at the server instead of paying for the
+    /// whole answer nobody is waiting for.
     pub async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<Turn> {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
-            "stream": false,
+            "stream": true,
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
@@ -168,11 +286,28 @@ impl Client {
         }
         let response = request.send().await.context("calling the model")?;
         let status = response.status();
-        let text = response.text().await.context("reading model response")?;
         if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
             bail!("model returned {status}: {}", text.trim());
         }
-        parse_turn(&text)
+
+        let mut stream = std::pin::pin!(response.bytes_stream());
+        let mut accumulator = StreamAccumulator::default();
+        let mut buffer: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buffer.extend_from_slice(&chunk.context("reading the model stream")?);
+            if buffer.len() > MAX_STREAM_LINE_BYTES {
+                bail!("model streamed an oversized line");
+            }
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                // a full line is complete json, so lossy decoding cannot split a char
+                if !accumulator.push(&String::from_utf8_lossy(&line))? {
+                    return Ok(accumulator.finish());
+                }
+            }
+        }
+        Ok(accumulator.finish())
     }
 }
 
@@ -180,36 +315,57 @@ impl Client {
 mod tests {
     use super::*;
 
-    /// llama-server b10052 answering without tools: real content plus the thoughts
-    /// it split out into reasoning_content, and no tool_calls key at all
+    /// feeds a whole sse transcript, stopping at [DONE] like the client does
+    fn accumulate(lines: &[&str]) -> Result<Turn> {
+        let mut accumulator = StreamAccumulator::default();
+        for line in lines {
+            if !accumulator.push(line)? {
+                break;
+            }
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// llama-server b10052 answering without tools: an opening chunk with a null
+    /// content, thinking split into reasoning_content, then the real content
     #[test]
-    fn parses_llama_server_text_response() {
-        let body = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{
-            "role":"assistant","content":"PONG",
-            "reasoning_content":"The user is asking for a specific word.\n"}}],
-            "model":"/models/Qwen3.5-9B-Q4_K_M.gguf","object":"chat.completion",
-            "system_fingerprint":"b10052-b2dd28a3b"}"#;
-        let turn = parse_turn(body).expect("parses");
+    fn accumulates_a_llama_server_text_response() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"object":"chat.completion.chunk"}"#,
+            "",
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"The user wants"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":" one word.\n"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"PO"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"NG"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
         assert_eq!(turn.text.as_deref(), Some("PONG"));
         assert!(turn.tool_calls.is_empty());
     }
 
-    /// llama-server sends an empty content string next to tool_calls, and puts the
-    /// id after the function object. x.ai sends null content and no reasoning.
+    /// the exact delta sequence llama-server streams for a tool call: id and name
+    /// on the first chunk, then the arguments one fragment at a time
     #[test]
-    fn parses_llama_server_tool_call_with_empty_content() {
-        let body = r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{
-            "role":"assistant","content":"",
-            "reasoning_content":"I should call get_weather with Paris.\n",
-            "tool_calls":[{"type":"function","function":{
-                "name":"get_weather","arguments":"{\"city\":\"Paris\"}"},
-                "id":"KpuUpnfE7rnh4OJlomSmc9sWEl7ffQa2"}]}}]}"#;
-        let turn = parse_turn(body).expect("parses");
+    fn assembles_tool_call_arguments_from_fragments() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Call it.\n"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"WdRbfwqmabBQiIPAe4wSLKYDakX0iL2E","type":"function","function":{"name":"get_weather","arguments":"{"}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"city\":\""}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris"}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
         assert_eq!(turn.text, None, "thoughts must not become assistant text");
         assert_eq!(
             turn.tool_calls,
             vec![ToolCall {
-                id: "KpuUpnfE7rnh4OJlomSmc9sWEl7ffQa2".into(),
+                id: "WdRbfwqmabBQiIPAe4wSLKYDakX0iL2E".into(),
                 kind: "function".into(),
                 function: FunctionCall {
                     name: "get_weather".into(),
@@ -219,41 +375,103 @@ mod tests {
         );
     }
 
-    /// a thinking model can burn its whole budget before writing any content,
-    /// which would otherwise make the run finish with nothing to show
+    /// a thinking model can burn its whole budget before writing any content
     #[test]
     fn falls_back_to_reasoning_when_nothing_else_came_back() {
-        let body = r#"{"choices":[{"finish_reason":"length","index":0,"message":{
-            "role":"assistant","content":"",
-            "reasoning_content":"Thinking Process:\n1. Analyze the request"}}]}"#;
-        let turn = parse_turn(body).expect("parses");
-        assert_eq!(
-            turn.text.as_deref(),
-            Some("Thinking Process:\n1. Analyze the request")
-        );
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Thinking Process:"}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":" analyze"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":"length","index":0,"delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
+        assert_eq!(turn.text.as_deref(), Some("Thinking Process: analyze"));
     }
 
-    /// the cloud shape stays exactly as it was: null content beside tool calls
+    /// the cloud dialect: no reasoning field, whole tool call in one delta
     #[test]
-    fn parses_cloud_tool_call_with_null_content() {
-        let body = r#"{"choices":[{"index":0,"finish_reason":"tool_calls","message":{
-            "role":"assistant","content":null,
-            "tool_calls":[{"id":"call_123","type":"function","function":{
-                "name":"list_datasets","arguments":"{}"}}]}}]}"#;
-        let turn = parse_turn(body).expect("parses");
+    fn accumulates_a_cloud_shaped_tool_call() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_123","type":"function","function":{"name":"list_datasets","arguments":"{}"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
         assert_eq!(turn.text, None);
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.name, "list_datasets");
+        assert_eq!(turn.tool_calls[0].function.arguments, "{}");
     }
 
     #[test]
-    fn blank_response_yields_an_empty_turn() {
-        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"  "}}]}"#;
-        assert_eq!(parse_turn(body).expect("parses"), Turn::default());
+    fn keeps_two_tool_calls_apart_by_index() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"first","arguments":"{\"x\":"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"second","arguments":"{\"y\":"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[0].function.arguments, r#"{"x":1}"#);
+        assert_eq!(turn.tool_calls[1].function.arguments, r#"{"y":2}"#);
+    }
+
+    /// llama-server reports a mid-stream failure after already sending a 200
+    #[test]
+    fn an_error_chunk_fails_the_call() {
+        let err = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}"#,
+            r#"data: {"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}"#,
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Context size has been exceeded"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
-    fn no_choices_is_an_error() {
-        assert!(parse_turn(r#"{"choices":[]}"#).is_err());
+    fn nothing_after_done_is_read() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"content":"kept"}}]}"#,
+            "data: [DONE]",
+            r#"data: {"choices":[{"index":0,"delta":{"content":" dropped"}}]}"#,
+        ])
+        .expect("accumulates");
+        assert_eq!(turn.text.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_blank_stream_yields_an_empty_turn() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"content":"   "}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
+        assert_eq!(turn, Turn::default());
+    }
+
+    #[test]
+    fn a_runaway_tool_call_index_is_refused() {
+        let err = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":100000,"id":"x","function":{"name":"boom","arguments":"{}"}}]}}]}"#,
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("tool calls"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn a_nameless_tool_call_is_dropped() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi","tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("accumulates");
+        assert!(turn.tool_calls.is_empty());
+        assert_eq!(turn.text.as_deref(), Some("hi"));
     }
 }

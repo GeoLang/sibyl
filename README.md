@@ -91,4 +91,6 @@ A switch applies to the next run. A run already going finishes on the profile it
 
 Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`. A run that hits `SIBYL_MAX_MODEL_CALLS` or `SIBYL_RUN_BUDGET_SECS` ends with an `error` event naming which one it was.
 
+Dropping the NDJSON connection cancels the run. sibyl requests completions with `stream: true` and accumulates them server side, so a dropped run also drops the in-flight request and the model server stops generating instead of finishing an answer nobody is waiting for. The loop checks for a departed client before each model call too, in case the disconnect lands between calls. The event shape is unchanged either way, sibyl does not forward partial tokens.
+
 The tool manifest comes from `GET {GEOLANG_URL}/tools` and is cached for 60 seconds, tool calls go to `POST {GEOLANG_URL}/tools/{name}` with `{"args": {...}}` and read back `.result`.

@@ -73,6 +73,41 @@ The one exception is tool-call salvage. A small model sometimes prints a tool ca
 
 Keep system prompts explicit about when to call what, keep tool schemas small, and stay on the cloud model wherever a wrong tool call is expensive.
 
+### Model on another machine (shared with liquid)
+
+To serve the model from a remote box that also runs [liquid](https://github.com/boxerab/liquid), share liquid's own managed server instead of loading a second model. Two pieces:
+
+1. On the remote machine, pin liquid's inference port in `~/.config/liquid/liquid.toml` so it stops picking a random one:
+
+   ```toml
+   [inference]
+   tier = "gpu-mid"
+   port = 18200
+   ```
+
+   liquid launches llama-server on `127.0.0.1:18200` when its inference is in use. b10052+ has `--jinja` on by default, so OpenAI tool calls work; liquid's `--reasoning off` is harmless here. The model is whatever liquid's tier says, `SIBYL_MODEL` is only a label. liquid runs `--parallel 1`, so sibyl runs and liquid's own jobs queue behind each other, and the local profile only works while liquid's server is up. Switch to the cloud profile in the viewer settings when it isn't.
+
+2. On the machine running the stack, a systemd user unit holds an SSH tunnel from the docker bridge to the remote loopback, so nothing is exposed on the LAN and the container reaches it as `host.docker.internal`:
+
+   ```ini
+   # ~/.config/systemd/user/geolang-llama-tunnel.service
+   [Unit]
+   Description=SSH tunnel to the remote llama-server (sibyl local model)
+   After=network-online.target
+
+   [Service]
+   ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -L 172.17.0.1:18200:127.0.0.1:18200 aaron@hercules
+   Restart=always
+   RestartSec=3
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   `systemctl --user enable --now geolang-llama-tunnel`, then start sibyl with `SIBYL_API_BASE=http://host.docker.internal:18200/v1` and a `SIBYL_MODEL` label matching the tier.
+
+For a dedicated always-on server on the remote box instead (a second loaded model, but independent of liquid's lifecycle), use the launch line from the section above over SSH with `nohup`, and keep `--n-cpu-moe` for MoE tiers per liquid's own tuning.
+
 ## API
 
 - `GET /health` service liveness

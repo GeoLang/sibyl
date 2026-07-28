@@ -16,6 +16,7 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | `SIBYL_TOOL_TIMEOUT_SECS` | `600` | per tool call |
 | `SIBYL_MAX_MODEL_CALLS` | `30` | model calls per run |
 | `SIBYL_RUN_BUDGET_SECS` | `900` | wall clock per run |
+| `SIBYL_MAX_TOKENS` | unset | `max_tokens` per request, mainly for thinking models on small context windows, which otherwise think until the context runs out |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank the base URL or the model.
 

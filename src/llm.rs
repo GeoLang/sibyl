@@ -244,6 +244,8 @@ pub struct Client {
     /// none when running against a keyless server, no auth header is sent then
     api_key: Option<String>,
     model: String,
+    /// none sends no `max_tokens` at all, leaving the server's own default alone
+    max_tokens: Option<u32>,
 }
 
 impl Client {
@@ -252,12 +254,14 @@ impl Client {
         api_base: String,
         api_key: Option<String>,
         model: String,
+        max_tokens: Option<u32>,
     ) -> Self {
         Self {
             http,
             api_base,
             api_key,
             model,
+            max_tokens,
         }
     }
 
@@ -276,6 +280,9 @@ impl Client {
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            body["max_tokens"] = max_tokens.into();
         }
         let mut request = self
             .http
@@ -373,6 +380,40 @@ mod tests {
                 },
             }]
         );
+    }
+
+    /// hitting SIBYL_MAX_TOKENS mid-answer stops the stream with finish_reason
+    /// "length". the half-written answer is still an answer, not a failure, so the
+    /// loop carries on with it.
+    #[test]
+    fn a_truncated_answer_is_content_not_an_error() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"The rainfall dataset covers"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" every county from 19"}}]}"#,
+            r#"data: {"choices":[{"finish_reason":"length","index":0,"delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("a truncated answer must still parse");
+        assert_eq!(
+            turn.text.as_deref(),
+            Some("The rainfall dataset covers every county from 19")
+        );
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    /// a tool call cut off by the cap leaves unparseable arguments, which the tool
+    /// executor reports back to the model rather than killing the run
+    #[test]
+    fn a_tool_call_truncated_by_the_cap_still_yields_a_turn() {
+        let turn = accumulate(&[
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"ci"}}]}}]}"#,
+            r#"data: {"choices":[{"finish_reason":"length","index":0,"delta":{}}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("a truncated tool call must still parse");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.arguments, r#"{"ci"#);
     }
 
     /// a thinking model can burn its whole budget before writing any content

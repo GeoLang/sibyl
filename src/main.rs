@@ -50,17 +50,33 @@ fn env_or(key: &str, default: &str) -> String {
     env_var(key).unwrap_or_else(|| default.to_string())
 }
 
+fn parse_env<T>(key: &str, raw: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    raw.parse()
+        .map_err(|err| anyhow::anyhow!("{key} must be a number: {err}"))
+}
+
 fn parse_or<T>(key: &str, raw: Option<String>, default: T) -> Result<T>
 where
     T: FromStr,
     T::Err: std::fmt::Display,
 {
     match raw {
-        Some(raw) => raw
-            .parse()
-            .map_err(|err| anyhow::anyhow!("{key} must be a number: {err}")),
+        Some(raw) => parse_env(key, &raw),
         None => Ok(default),
     }
+}
+
+/// for knobs whose absence means "do not send this at all", not "use a default"
+fn parse_optional<T>(key: &str, raw: Option<String>) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    raw.map(|raw| parse_env(key, &raw)).transpose()
 }
 
 fn env_parsed<T>(key: &str, default: T) -> Result<T>
@@ -91,6 +107,8 @@ async fn main() -> Result<()> {
     }
     let geolang_url = env_or("GEOLANG_URL", "http://geolang-api:8080");
     let tool_timeout = Duration::from_secs(env_parsed("SIBYL_TOOL_TIMEOUT_SECS", 600u64)?);
+    // unset sends no max_tokens at all, so a cloud request looks exactly as before
+    let max_tokens: Option<u32> = parse_optional("SIBYL_MAX_TOKENS", env_var("SIBYL_MAX_TOKENS"))?;
     let limits = RunLimits {
         max_model_calls: env_parsed("SIBYL_MAX_MODEL_CALLS", DEFAULT_MAX_MODEL_CALLS)?,
         budget: Duration::from_secs(env_parsed(
@@ -103,7 +121,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(600))
         .build()?;
     let db = Db::open(&db_path)?;
-    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?);
+    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?, max_tokens);
     let active = models.active_label();
     let state = AppState {
         db: Arc::new(db),
@@ -191,6 +209,23 @@ mod tests {
             .unwrap(),
             120
         );
+    }
+
+    /// unset must stay unset here: sending no cap is what keeps cloud requests
+    /// byte-identical to before
+    #[test]
+    fn the_token_cap_is_absent_unless_it_is_set() {
+        let cap = |raw: Option<&str>| {
+            parse_optional::<u32>("SIBYL_MAX_TOKENS", present(raw.map(str::to_string))).unwrap()
+        };
+        assert_eq!(cap(None), None);
+        assert_eq!(cap(Some("")), None);
+        assert_eq!(cap(Some("  ")), None);
+        assert_eq!(cap(Some("512")), Some(512));
+        assert_eq!(cap(Some(" 2048 ")), Some(2048));
+
+        let err = parse_optional::<u32>("SIBYL_MAX_TOKENS", Some("lots".into())).unwrap_err();
+        assert!(err.to_string().contains("SIBYL_MAX_TOKENS"));
     }
 
     #[test]

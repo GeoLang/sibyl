@@ -105,12 +105,18 @@ pub struct Models {
 impl Models {
     /// `stored` is the persisted choice, ignored when it names a profile that is
     /// no longer available so a pulled key cannot leave sibyl pointing at nothing
-    pub fn new(http: &reqwest::Client, specs: Specs, stored: Option<String>) -> Self {
+    pub fn new(
+        http: &reqwest::Client,
+        specs: Specs,
+        stored: Option<String>,
+        max_tokens: Option<u32>,
+    ) -> Self {
         let profiles = vec![
             build(
                 LOCAL,
                 specs.local,
                 http,
+                max_tokens,
                 |model| format!("Local ({model})"),
                 "Local (not configured)",
             ),
@@ -118,6 +124,7 @@ impl Models {
                 CLOUD,
                 specs.cloud,
                 http,
+                max_tokens,
                 |_| "Grok (cloud)".to_string(),
                 "Grok (cloud, no API key)",
             ),
@@ -196,6 +203,7 @@ fn build(
     id: &'static str,
     spec: Option<Spec>,
     http: &reqwest::Client,
+    max_tokens: Option<u32>,
     label: impl Fn(&str) -> String,
     missing: &str,
 ) -> Profile {
@@ -209,6 +217,7 @@ fn build(
                 spec.base,
                 spec.key,
                 spec.model,
+                max_tokens,
             ))),
         },
         None => Profile {
@@ -267,7 +276,12 @@ mod tests {
     }
 
     fn models(specs: Specs, stored: Option<&str>) -> Models {
-        Models::new(&reqwest::Client::new(), specs, stored.map(str::to_string))
+        Models::new(
+            &reqwest::Client::new(),
+            specs,
+            stored.map(str::to_string),
+            None,
+        )
     }
 
     #[test]

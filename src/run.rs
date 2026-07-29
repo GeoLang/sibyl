@@ -21,6 +21,7 @@ use tracing::warn;
 use crate::AppState;
 use crate::db::{Db, NewMessage, StoredMessage};
 use crate::llm::{ChatMessage, Client, ToolCall, Turn, estimated_tokens};
+use crate::tools::UserToken;
 
 pub const DEFAULT_MAX_MODEL_CALLS: usize = 30;
 pub const DEFAULT_RUN_BUDGET_SECS: u64 = 900;
@@ -82,6 +83,10 @@ impl EventSink {
 pub struct RunRequest {
     pub system_prompt: String,
     pub message: String,
+    /// bearer token of the person asking, forwarded to every tool call of this
+    /// run. absent for headless runs, which then call services anonymously.
+    #[serde(default)]
+    pub user_token: Option<UserToken>,
 }
 
 /// per-run ceilings, both operator-tunable. the wall clock one exists because a
@@ -477,13 +482,14 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
             |name, args| {
                 let catalog = state.catalog.clone();
                 let db = state.db.clone();
+                let user_token = req.user_token.clone();
                 async move {
                     // memory tools are sibyl-native: they live in sibyl's db,
                     // not the geolang executor
                     if let Some(result) = crate::memory::execute(&db, &name, &args) {
                         return result;
                     }
-                    catalog.execute(&name, &args).await
+                    catalog.execute(&name, &args, user_token.as_ref()).await
                 }
             },
         )
@@ -560,6 +566,31 @@ mod tests {
     use crate::db::testing::TempDb;
     use crate::llm::FunctionCall;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// the viewer sends a token, the eval runner and any other headless caller
+    /// send the same body without one
+    #[test]
+    fn the_user_token_is_optional_on_a_run_request() {
+        let headless: RunRequest =
+            serde_json::from_str(r#"{"system_prompt":"s","message":"m"}"#).unwrap();
+        assert!(headless.user_token.is_none());
+
+        let with_token: RunRequest = serde_json::from_str(
+            r#"{"system_prompt":"s","message":"m","user_token":"head.payload.sig"}"#,
+        )
+        .unwrap();
+        assert!(with_token.user_token.is_some());
+    }
+
+    #[test]
+    fn the_run_request_debug_hides_the_token() {
+        let req: RunRequest = serde_json::from_str(
+            r#"{"system_prompt":"s","message":"m","user_token":"head.payload.sig"}"#,
+        )
+        .unwrap();
+        let rendered = format!("{req:?}");
+        assert!(!rendered.contains("head.payload.sig"), "{rendered}");
+    }
 
     fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {

@@ -127,7 +127,13 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(600))
         .build()?;
     let db = Db::open(&db_path)?;
-    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?, max_tokens, thinking);
+    let models = Models::new(
+        &http,
+        specs,
+        db.get_config(ACTIVE_KEY)?,
+        max_tokens,
+        thinking,
+    );
     let active = models.active_label();
     let state = AppState {
         db: Arc::new(db),

@@ -139,6 +139,40 @@ pub fn truncate_tool_output(output: &str) -> String {
     truncated
 }
 
+/// a model that repeats the same failing tool call verbatim has stopped
+/// adapting (grok once burned a whole run on 30 identical emit_ui_spec
+/// errors), so the run aborts after this many identical failures in a row
+pub const MAX_IDENTICAL_FAILURES: usize = 3;
+
+#[derive(Default)]
+pub struct RepeatGuard {
+    last: Option<(String, String)>,
+    failures: usize,
+}
+
+impl RepeatGuard {
+    /// records one tool result; true when the same call just failed
+    /// MAX_IDENTICAL_FAILURES times in a row
+    fn tripped(&mut self, name: &str, args: &str, result: &str) -> bool {
+        if !(result.starts_with("❌") || result.starts_with("ERROR")) {
+            self.last = None;
+            self.failures = 0;
+            return false;
+        }
+        let same = self
+            .last
+            .as_ref()
+            .is_some_and(|(n, a)| n == name && a == args);
+        if same {
+            self.failures += 1;
+        } else {
+            self.last = Some((name.to_string(), args.to_string()));
+            self.failures = 1;
+        }
+        self.failures >= MAX_IDENTICAL_FAILURES
+    }
+}
+
 fn to_chat_message(stored: &StoredMessage) -> ChatMessage {
     let tool_calls = stored
         .tool_calls
@@ -260,6 +294,7 @@ pub async fn execute_turn<F, Fut>(
     turn: &Turn,
     execute: F,
     sink: &EventSink,
+    guard: &mut RepeatGuard,
 ) -> Result<bool>
 where
     F: Fn(String, String) -> Fut,
@@ -298,8 +333,15 @@ where
         .await;
         db.append_message(
             session_id,
-            &NewMessage::tool(call.id.clone(), call.function.name.clone(), result),
+            &NewMessage::tool(call.id.clone(), call.function.name.clone(), result.clone()),
         )?;
+        if guard.tripped(&call.function.name, &call.function.arguments, &result) {
+            anyhow::bail!(
+                "tool '{}' failed {MAX_IDENTICAL_FAILURES} times in a row with identical \
+                 arguments; aborting the run instead of burning the rest of the budget",
+                call.function.name
+            );
+        }
     }
     Ok(!turn.tool_calls.is_empty())
 }
@@ -348,6 +390,7 @@ impl Cycle<'_> {
     {
         let started = Instant::now();
         let mut calls = 0;
+        let mut guard = RepeatGuard::default();
 
         loop {
             // nobody is reading, so another model call would only burn tokens
@@ -369,7 +412,7 @@ impl Cycle<'_> {
                 Err(err) => return self.sink.fail(err).await,
             };
             let turn = crate::salvage::salvage_turn(turn, self.names);
-            match execute_turn(self.db, self.session_id, &turn, &execute, self.sink).await {
+            match execute_turn(self.db, self.session_id, &turn, &execute, self.sink, &mut guard).await {
                 Ok(true) => continue,
                 Ok(false) => return self.sink.send(Event::Done).await,
                 Err(err) => return self.sink.fail(err).await,
@@ -693,6 +736,7 @@ mod tests {
             &turn,
             |_name, _args| async { unreachable!("no tools in this response") },
             &sink,
+            &mut RepeatGuard::default(),
         )
         .await
         .unwrap();
@@ -729,6 +773,7 @@ mod tests {
             &turn,
             |name, args| async move { format!("{name}:{args}") },
             &sink,
+            &mut RepeatGuard::default(),
         )
         .await
         .unwrap();
@@ -785,6 +830,7 @@ mod tests {
             &turn,
             |_name, _args| async { "found nothing".to_string() },
             &sink,
+            &mut RepeatGuard::default(),
         )
         .await
         .unwrap();
@@ -799,6 +845,57 @@ mod tests {
         assert!(matches!(events[1], Event::ToolCall { .. }));
         assert!(matches!(events[2], Event::ToolReturn { .. }));
         assert_eq!(events.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_thrice_repeated_failing_call_aborts_the_run() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat").unwrap();
+        let turn = Turn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "emit_ui_spec", r#"{"ui_type":"map"}"#),
+                call("c2", "emit_ui_spec", r#"{"ui_type":"map"}"#),
+                call("c3", "emit_ui_spec", r#"{"ui_type":"map"}"#),
+            ],
+        };
+
+        let (sink, rx) = sink_and_events();
+        let err = execute_turn(
+            &temp.db,
+            &session.id,
+            &turn,
+            |_name, _args| async { "ERROR: a map spec needs at least one layer".to_string() },
+            &sink,
+            &mut RepeatGuard::default(),
+        )
+        .await
+        .unwrap_err();
+        drop(rx);
+
+        assert!(err.to_string().contains("3 times in a row"), "{err}");
+        // the failing returns are still in history so the next run can see them
+        let stored = temp.db.messages_after(&session.id, 0).unwrap();
+        assert_eq!(stored.iter().filter(|m| m.role == "tool").count(), 3);
+    }
+
+    #[test]
+    fn the_guard_resets_on_success_or_different_arguments() {
+        let mut guard = RepeatGuard::default();
+        // success in between resets the streak
+        assert!(!guard.tripped("t", "{}", "ERROR: x"));
+        assert!(!guard.tripped("t", "{}", "ok"));
+        assert!(!guard.tripped("t", "{}", "ERROR: x"));
+        // changing arguments is adapting, not looping
+        assert!(!guard.tripped("t", r#"{"a":1}"#, "ERROR: x"));
+        assert!(!guard.tripped("t", r#"{"a":2}"#, "ERROR: x"));
+        assert!(!guard.tripped("t", r#"{"a":2}"#, "ERROR: x"));
+        assert!(guard.tripped("t", r#"{"a":2}"#, "ERROR: x"));
+        // emoji-style tool failures count too
+        let mut guard = RepeatGuard::default();
+        assert!(!guard.tripped("t", "{}", "❌ boom"));
+        assert!(!guard.tripped("t", "{}", "❌ boom"));
+        assert!(guard.tripped("t", "{}", "❌ boom"));
     }
 
     fn seed_overflow(db: &Db, session_id: &str, count: usize) {

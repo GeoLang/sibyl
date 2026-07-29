@@ -190,15 +190,21 @@ fn to_chat_message(stored: &StoredMessage) -> ChatMessage {
 
 fn build_request(
     system_prompt: &str,
+    memories: Option<&str>,
     summary: Option<&str>,
     history: &[StoredMessage],
 ) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::system(system_prompt)];
-    if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
-        messages.push(ChatMessage::system(format!(
-            "Previous conversation summary: {summary}"
-        )));
+    // everything rides in ONE system message: qwen's chat template raises
+    // "System message must be at the beginning" for any later system message
+    let mut system = system_prompt.to_string();
+    if let Some(memories) = memories {
+        system.push_str("\n\n");
+        system.push_str(memories);
     }
+    if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+        system.push_str(&format!("\n\nPrevious conversation summary: {summary}"));
+    }
+    let mut messages = vec![ChatMessage::system(system)];
     messages.extend(history.iter().map(to_chat_message));
     messages
 }
@@ -251,7 +257,14 @@ where
         .get_session(session_id)?
         .context("session disappeared mid run")?;
     let history = db.messages_after(session_id, session.summary_watermark)?;
-    let messages = build_request(system_prompt, session.summary.as_deref(), &history);
+    let memories = crate::memory::context_block(db);
+    let memories = memories.as_deref();
+    let messages = build_request(
+        system_prompt,
+        memories,
+        session.summary.as_deref(),
+        &history,
+    );
 
     if estimated_tokens(&messages) <= SUMMARIZE_THRESHOLD_TOKENS {
         return Ok(messages);
@@ -271,13 +284,14 @@ where
             };
             let watermark = older.last().map_or(session.summary_watermark, |msg| msg.id);
             db.set_summary(session_id, &merged, watermark)?;
-            Ok(build_request(system_prompt, Some(&merged), keep))
+            Ok(build_request(system_prompt, memories, Some(&merged), keep))
         }
         Err(err) => {
             // summarizing failed, drop the oldest messages for this request only
             warn!("summarization failed, dropping oldest messages: {err}");
             Ok(build_request(
                 system_prompt,
+                memories,
                 session.summary.as_deref(),
                 keep,
             ))
@@ -431,10 +445,11 @@ impl Cycle<'_> {
 }
 
 async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: &EventSink) {
-    let tools = match state.catalog.tools().await {
+    let mut tools = match state.catalog.tools().await {
         Ok(tools) => tools,
         Err(err) => return sink.fail(err).await,
     };
+    tools.extend(crate::memory::tool_defs());
     let tools = Arc::new(tools);
     let names = tool_names(&tools);
     // captured once, so switching profiles mid-run cannot swap the client underneath
@@ -461,7 +476,15 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
             },
             |name, args| {
                 let catalog = state.catalog.clone();
-                async move { catalog.execute(&name, &args).await }
+                let db = state.db.clone();
+                async move {
+                    // memory tools are sibyl-native: they live in sibyl's db,
+                    // not the geolang executor
+                    if let Some(result) = crate::memory::execute(&db, &name, &args) {
+                        return result;
+                    }
+                    catalog.execute(&name, &args).await
+                }
             },
         )
         .await;
@@ -928,13 +951,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(messages[0].content.as_deref(), Some("be useful"));
         assert_eq!(
-            messages[1].content.as_deref(),
-            Some("Previous conversation summary: canned summary")
+            messages[0].content.as_deref(),
+            Some("be useful\n\nPrevious conversation summary: canned summary")
         );
-        assert_eq!(messages.len(), 2 + KEEP_RECENT_MESSAGES);
-        assert!(messages[2].content.as_deref().unwrap().starts_with("40 "));
+        assert_eq!(messages.len(), 1 + KEEP_RECENT_MESSAGES);
+        assert!(messages[1].content.as_deref().unwrap().starts_with("40 "));
 
         let stored = temp.db.get_session(&session.id).unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("canned summary"));
@@ -947,7 +969,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(again.len(), 2 + KEEP_RECENT_MESSAGES);
+        assert_eq!(again.len(), 1 + KEEP_RECENT_MESSAGES);
     }
 
     #[tokio::test]
@@ -1004,6 +1026,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_memories_ride_along_as_a_system_message() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat").unwrap();
+        temp.db.add_memory("user's study area is Lisbon").unwrap();
+        temp.db
+            .append_message(&session.id, &NewMessage::user("hi"))
+            .unwrap();
+
+        let messages = assemble(&temp.db, &session.id, "be useful", |_older| async move {
+            panic!("no summarization for a short history")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(system.starts_with("be useful"));
+        assert!(system.contains("Persistent memory"));
+        assert!(system.contains("Lisbon"));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[tokio::test]
     async fn the_kept_window_never_starts_with_an_orphan_tool_result() {
         let temp = TempDb::new();
         let session = temp.db.create_session("chat").unwrap();
@@ -1023,7 +1068,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(messages[2..].iter().all(|m| m.role != "tool"));
-        assert_eq!(messages.len(), 2 + (KEEP_RECENT_MESSAGES - 1));
+        assert!(messages[1..].iter().all(|m| m.role != "tool"));
+        assert_eq!(messages.len(), 1 + (KEEP_RECENT_MESSAGES - 1));
     }
 }

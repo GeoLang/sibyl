@@ -1,5 +1,6 @@
 mod db;
 mod llm;
+mod memory;
 mod models;
 mod run;
 mod salvage;

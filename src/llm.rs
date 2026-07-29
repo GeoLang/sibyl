@@ -238,6 +238,11 @@ impl StreamAccumulator {
     }
 }
 
+/// qwen's own sampling for thinking mode, which differs from the non-thinking
+/// defaults llama-server was started with
+const THINKING_TEMP: f64 = 0.6;
+const THINKING_TOP_P: f64 = 0.95;
+
 pub struct Client {
     http: reqwest::Client,
     api_base: String,
@@ -246,6 +251,10 @@ pub struct Client {
     model: String,
     /// none sends no `max_tokens` at all, leaving the server's own default alone
     max_tokens: Option<u32>,
+    /// asks llama-server for thinking per request, overriding its startup
+    /// `--reasoning off`. only ever set on the local profile: the cloud api
+    /// does not know `chat_template_kwargs`.
+    thinking: bool,
 }
 
 impl Client {
@@ -255,6 +264,7 @@ impl Client {
         api_key: Option<String>,
         model: String,
         max_tokens: Option<u32>,
+        thinking: bool,
     ) -> Self {
         Self {
             http,
@@ -262,6 +272,7 @@ impl Client {
             api_key,
             model,
             max_tokens,
+            thinking,
         }
     }
 
@@ -273,6 +284,19 @@ impl Client {
     /// lets a dropped run stop generation at the server instead of paying for the
     /// whole answer nobody is waiting for.
     pub async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<Turn> {
+        let body = self.body(messages, tools);
+        let mut request = self
+            .http
+            .post(format!("{}/chat/completions", self.api_base))
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.context("calling the model")?;
+        self.stream_turn(response).await
+    }
+
+    fn body(&self, messages: &[ChatMessage], tools: &[Value]) -> Value {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
@@ -284,14 +308,15 @@ impl Client {
         if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = max_tokens.into();
         }
-        let mut request = self
-            .http
-            .post(format!("{}/chat/completions", self.api_base))
-            .json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
+        if self.thinking {
+            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": true });
+            body["temperature"] = THINKING_TEMP.into();
+            body["top_p"] = THINKING_TOP_P.into();
         }
-        let response = request.send().await.context("calling the model")?;
+        body
+    }
+
+    async fn stream_turn(&self, response: reqwest::Response) -> Result<Turn> {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -321,6 +346,35 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client(thinking: bool) -> Client {
+        Client::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1".into(),
+            None,
+            "qwen".into(),
+            None,
+            thinking,
+        )
+    }
+
+    #[test]
+    fn thinking_adds_the_template_kwarg_and_qwen_sampling() {
+        let body = client(true).body(&[ChatMessage::user("hi")], &[]);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["temperature"], 0.6);
+        assert_eq!(body["top_p"], 0.95);
+    }
+
+    /// a cloud request must stay byte-identical to before: no template kwargs,
+    /// no sampling overrides
+    #[test]
+    fn without_thinking_the_body_carries_no_extras() {
+        let body = client(false).body(&[ChatMessage::user("hi")], &[]);
+        for key in ["chat_template_kwargs", "temperature", "top_p"] {
+            assert!(body.get(key).is_none(), "{key} leaked into the body");
+        }
+    }
 
     /// feeds a whole sse transcript, stopping at [DONE] like the client does
     fn accumulate(lines: &[&str]) -> Result<Turn> {

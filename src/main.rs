@@ -110,6 +110,11 @@ async fn main() -> Result<()> {
     let tool_timeout = Duration::from_secs(env_parsed("SIBYL_TOOL_TIMEOUT_SECS", 600u64)?);
     // unset sends no max_tokens at all, so a cloud request looks exactly as before
     let max_tokens: Option<u32> = parse_optional("SIBYL_MAX_TOKENS", env_var("SIBYL_MAX_TOKENS"))?;
+    let thinking = env_var("SIBYL_THINKING")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if thinking {
+        info!("thinking enabled for the local profile");
+    }
     let limits = RunLimits {
         max_model_calls: env_parsed("SIBYL_MAX_MODEL_CALLS", DEFAULT_MAX_MODEL_CALLS)?,
         budget: Duration::from_secs(env_parsed(
@@ -122,7 +127,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(600))
         .build()?;
     let db = Db::open(&db_path)?;
-    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?, max_tokens);
+    let models = Models::new(&http, specs, db.get_config(ACTIVE_KEY)?, max_tokens, thinking);
     let active = models.active_label();
     let state = AppState {
         db: Arc::new(db),

@@ -17,6 +17,7 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | `SIBYL_MAX_MODEL_CALLS` | `30` | model calls per run |
 | `SIBYL_RUN_BUDGET_SECS` | `900` | wall clock per run |
 | `SIBYL_MAX_TOKENS` | unset | `max_tokens` per request, mainly for thinking models on small context windows, which otherwise think until the context runs out |
+| `SIBYL_THINKING` | unset | `1`/`true` asks the local llama-server for thinking per request (`chat_template_kwargs`) with qwen's thinking sampling, overriding its startup `--reasoning off`. Local profile only, cloud requests are untouched |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank the base URL or the model.
 

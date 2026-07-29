@@ -110,6 +110,7 @@ impl Models {
         specs: Specs,
         stored: Option<String>,
         max_tokens: Option<u32>,
+        thinking: bool,
     ) -> Self {
         let profiles = vec![
             build(
@@ -117,6 +118,9 @@ impl Models {
                 specs.local,
                 http,
                 max_tokens,
+                // thinking only reaches the local llama-server: the cloud api
+                // would reject or ignore chat_template_kwargs
+                thinking,
                 |model| format!("Local ({model})"),
                 "Local (not configured)",
             ),
@@ -125,6 +129,7 @@ impl Models {
                 specs.cloud,
                 http,
                 max_tokens,
+                false,
                 |_| "Grok (cloud)".to_string(),
                 "Grok (cloud, no API key)",
             ),
@@ -204,6 +209,7 @@ fn build(
     spec: Option<Spec>,
     http: &reqwest::Client,
     max_tokens: Option<u32>,
+    thinking: bool,
     label: impl Fn(&str) -> String,
     missing: &str,
 ) -> Profile {
@@ -218,6 +224,7 @@ fn build(
                 spec.key,
                 spec.model,
                 max_tokens,
+                thinking,
             ))),
         },
         None => Profile {
@@ -281,6 +288,7 @@ mod tests {
             specs,
             stored.map(str::to_string),
             None,
+            false,
         )
     }
 

@@ -112,6 +112,11 @@ impl Db {
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
         Ok(Self {
@@ -282,6 +287,50 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn add_memory(&self, content: &str) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO memories (content, created_at) VALUES (?1, ?2)",
+            params![content, now()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// oldest first, capped so injected context stays bounded
+    pub fn list_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, content, created_at FROM memories
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let mut memories = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(Memory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        memories.reverse();
+        Ok(memories)
+    }
+
+    pub fn delete_memories_matching(&self, needle: &str) -> Result<usize> {
+        let deleted = self.conn().execute(
+            "DELETE FROM memories WHERE content LIKE '%' || ?1 || '%'",
+            params![needle],
+        )?;
+        Ok(deleted)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Memory {
+    pub id: i64,
+    pub content: String,
+    pub created_at: String,
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {

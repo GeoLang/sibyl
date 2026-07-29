@@ -412,7 +412,16 @@ impl Cycle<'_> {
                 Err(err) => return self.sink.fail(err).await,
             };
             let turn = crate::salvage::salvage_turn(turn, self.names);
-            match execute_turn(self.db, self.session_id, &turn, &execute, self.sink, &mut guard).await {
+            match execute_turn(
+                self.db,
+                self.session_id,
+                &turn,
+                &execute,
+                self.sink,
+                &mut guard,
+            )
+            .await
+            {
                 Ok(true) => continue,
                 Ok(false) => return self.sink.send(Event::Done).await,
                 Err(err) => return self.sink.fail(err).await,

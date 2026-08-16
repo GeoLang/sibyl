@@ -188,6 +188,27 @@ impl Db {
         Ok(session)
     }
 
+    /// look up `id`, or insert it without touching the active flag
+    pub fn get_or_create_session(&self, id: &str, name: &str) -> Result<Session> {
+        if let Some(session) = self.get_session(id)? {
+            return Ok(session);
+        }
+        let session = Session {
+            id: id.to_string(),
+            name: name.to_string(),
+            created_at: now(),
+            active: false,
+            summary: None,
+            summary_watermark: 0,
+        };
+        self.conn().execute(
+            "INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark)
+             VALUES (?1, ?2, ?3, 0, NULL, 0)",
+            params![session.id, session.name, session.created_at],
+        )?;
+        Ok(session)
+    }
+
     pub fn activate_session(&self, id: &str) -> Result<Option<Session>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -396,6 +417,22 @@ mod tests {
         assert!(activated.active);
         assert_eq!(temp.db.active_session().unwrap().unwrap().id, first.id);
         assert!(temp.db.activate_session("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_or_create_does_not_steal_active() {
+        let temp = TempDb::new();
+        let first = temp.db.create_session("first").unwrap();
+        let other = temp.db.get_or_create_session("thread-a", "tab").unwrap();
+        assert_eq!(other.id, "thread-a");
+        assert!(!other.active);
+        assert_eq!(temp.db.active_session().unwrap().unwrap().id, first.id);
+        let again = temp
+            .db
+            .get_or_create_session("thread-a", "ignored")
+            .unwrap();
+        assert_eq!(again.id, other.id);
+        assert_eq!(again.name, "tab");
     }
 
     #[test]

@@ -120,7 +120,7 @@ For a dedicated always-on server on the remote box instead (a second loaded mode
 - `POST /sessions/{id}/messages` `{"content"}` appends a user message without running the model
 - `GET /models` `{"active", "profiles":[{"id","label","model","available"}]}`
 - `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable
-- `POST /runs` `{"system_prompt","message","user_token"?}` runs the agent loop against the active session, NDJSON stream. `user_token` is the caller's bearer token, sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. Without it the tools call services unauthenticated.
+- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the process-wide active session is used. `user_token` is the caller's bearer token, sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. Without it the tools call services unauthenticated.
 
 These endpoints are unauthenticated, like the rest of sibyl's API, which already exposes run execution: put it behind something that authenticates.
 

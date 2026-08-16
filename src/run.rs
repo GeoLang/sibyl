@@ -87,6 +87,10 @@ pub struct RunRequest {
     /// run. absent for headless runs, which then call services anonymously.
     #[serde(default)]
     pub user_token: Option<UserToken>,
+    /// AG-UI thread, used as the session id. absent falls back to the
+    /// process-wide active session.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// per-run ceilings, both operator-tunable. the wall clock one exists because a
@@ -520,21 +524,24 @@ impl Stream for GuardedStream {
     }
 }
 
+fn resolve_session(db: &Db, thread_id: Option<&str>) -> Result<crate::db::Session> {
+    if let Some(id) = thread_id.filter(|s| !s.is_empty()) {
+        return db.get_or_create_session(id, "Default");
+    }
+    match db.active_session()? {
+        Some(session) => Ok(session),
+        None => db.create_session("Default"),
+    }
+}
+
 pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
     let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(64);
     let sink = EventSink::new(tx);
 
     let task = tokio::spawn(async move {
         let _guard = state.run_lock.clone().lock_owned().await;
-        let session = match state.db.active_session() {
-            Ok(Some(session)) => Some(session),
-            Ok(None) => match state.db.create_session("Default") {
-                Ok(session) => Some(session),
-                Err(err) => {
-                    sink.fail(err).await;
-                    None
-                }
-            },
+        let session = match resolve_session(&state.db, req.thread_id.as_deref()) {
+            Ok(session) => Some(session),
             Err(err) => {
                 sink.fail(err).await;
                 None
@@ -580,6 +587,22 @@ mod tests {
         )
         .unwrap();
         assert!(with_token.user_token.is_some());
+        assert!(with_token.thread_id.is_none());
+
+        let threaded: RunRequest =
+            serde_json::from_str(r#"{"system_prompt":"s","message":"m","thread_id":"sess-1"}"#)
+                .unwrap();
+        assert_eq!(threaded.thread_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn resolve_session_uses_thread_id_without_touching_active() {
+        let temp = TempDb::new();
+        let active = temp.db.create_session("active").unwrap();
+        let resolved = resolve_session(&temp.db, Some("tab-a")).unwrap();
+        assert_eq!(resolved.id, "tab-a");
+        assert_eq!(temp.db.active_session().unwrap().unwrap().id, active.id);
+        assert_eq!(resolve_session(&temp.db, None).unwrap().id, active.id);
     }
 
     #[test]

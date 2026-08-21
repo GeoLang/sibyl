@@ -112,13 +112,9 @@ impl Db {
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
             );",
         )?;
+        migrate_memories(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -309,24 +305,25 @@ impl Db {
         Ok(())
     }
 
-    pub fn add_memory(&self, content: &str) -> Result<i64> {
+    pub fn add_memory(&self, session_id: &str, content: &str) -> Result<i64> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO memories (content, created_at) VALUES (?1, ?2)",
-            params![content, now()],
+            "INSERT INTO memories (session_id, content, created_at) VALUES (?1, ?2, ?3)",
+            params![session_id, content, now()],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     /// oldest first, capped so injected context stays bounded
-    pub fn list_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+    pub fn list_memories(&self, session_id: &str, limit: usize) -> Result<Vec<Memory>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, content, created_at FROM memories
-             ORDER BY id DESC LIMIT ?1",
+             WHERE session_id = ?1
+             ORDER BY id DESC LIMIT ?2",
         )?;
         let mut memories = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![session_id, limit as i64], |row| {
                 Ok(Memory {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -338,10 +335,10 @@ impl Db {
         Ok(memories)
     }
 
-    pub fn delete_memories_matching(&self, needle: &str) -> Result<usize> {
+    pub fn delete_memories_matching(&self, session_id: &str, needle: &str) -> Result<usize> {
         let deleted = self.conn().execute(
-            "DELETE FROM memories WHERE content LIKE '%' || ?1 || '%'",
-            params![needle],
+            "DELETE FROM memories WHERE session_id = ?1 AND content LIKE '%' || ?2 || '%'",
+            params![session_id, needle],
         )?;
         Ok(deleted)
     }
@@ -352,6 +349,35 @@ pub struct Memory {
     pub id: i64,
     pub content: String,
     pub created_at: String,
+}
+
+fn memories_have_session_id(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "session_id" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_memories(conn: &Connection) -> Result<()> {
+    // old memories had no session and leaked across users; drop them
+    if !memories_have_session_id(conn)? {
+        conn.execute_batch("DROP TABLE IF EXISTS memories;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS memories_session_idx ON memories(session_id, id);",
+    )?;
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -462,10 +488,14 @@ mod tests {
         temp.db
             .append_message(&session.id, &NewMessage::user("hello"))
             .unwrap();
+        temp.db
+            .add_memory(&session.id, "a fact that should go with the session")
+            .unwrap();
 
         assert!(temp.db.delete_session(&session.id).unwrap());
         assert!(temp.db.get_session(&session.id).unwrap().is_none());
         assert!(temp.db.messages_after(&session.id, 0).unwrap().is_empty());
+        assert!(temp.db.list_memories(&session.id, 50).unwrap().is_empty());
         assert!(!temp.db.delete_session(&session.id).unwrap());
     }
 
@@ -527,5 +557,69 @@ mod tests {
         let stored = temp.db.get_session(&session.id).unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("earlier work"));
         assert_eq!(stored.summary_watermark, 7);
+    }
+
+    #[test]
+    fn memories_are_scoped_to_a_session() {
+        let temp = TempDb::new();
+        let a = temp.db.create_session("a").unwrap();
+        let b = temp.db.create_session("b").unwrap();
+        temp.db.add_memory(&a.id, "lisbon").unwrap();
+        temp.db.add_memory(&b.id, "porto").unwrap();
+
+        let from_a = temp.db.list_memories(&a.id, 50).unwrap();
+        assert_eq!(
+            from_a
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lisbon"]
+        );
+        let from_b = temp.db.list_memories(&b.id, 50).unwrap();
+        assert_eq!(
+            from_b
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["porto"]
+        );
+
+        assert_eq!(
+            temp.db.delete_memories_matching(&a.id, "lisbon").unwrap(),
+            1
+        );
+        assert!(temp.db.list_memories(&a.id, 50).unwrap().is_empty());
+        assert_eq!(temp.db.list_memories(&b.id, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn old_global_memories_are_dropped_on_open() {
+        let path = std::env::temp_dir()
+            .join("sibyl-tests")
+            .join(format!("{}.db", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO memories (content, created_at)
+                VALUES ('leaked secret', '2020-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let session = db.create_session("chat").unwrap();
+        assert!(db.list_memories(&session.id, 50).unwrap().is_empty());
+        db.add_memory(&session.id, "stays in this session").unwrap();
+        assert_eq!(
+            db.list_memories(&session.id, 50).unwrap()[0].content,
+            "stays in this session"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

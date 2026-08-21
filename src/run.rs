@@ -266,7 +266,7 @@ where
         .get_session(session_id)?
         .context("session disappeared mid run")?;
     let history = db.messages_after(session_id, session.summary_watermark)?;
-    let memories = crate::memory::context_block(db);
+    let memories = crate::memory::context_block(db, session_id);
     let memories = memories.as_deref();
     let messages = build_request(
         system_prompt,
@@ -487,10 +487,11 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
                 let catalog = state.catalog.clone();
                 let db = state.db.clone();
                 let user_token = req.user_token.clone();
+                let session_id = session_id.to_string();
                 async move {
                     // memory tools are sibyl-native: they live in sibyl's db,
                     // not the geolang executor
-                    if let Some(result) = crate::memory::execute(&db, &name, &args) {
+                    if let Some(result) = crate::memory::execute(&db, &session_id, &name, &args) {
                         return result;
                     }
                     catalog.execute(&name, &args, user_token.as_ref()).await
@@ -1083,7 +1084,9 @@ mod tests {
     async fn saved_memories_ride_along_as_a_system_message() {
         let temp = TempDb::new();
         let session = temp.db.create_session("chat").unwrap();
-        temp.db.add_memory("user's study area is Lisbon").unwrap();
+        temp.db
+            .add_memory(&session.id, "user's study area is Lisbon")
+            .unwrap();
         temp.db
             .append_message(&session.id, &NewMessage::user("hi"))
             .unwrap();
@@ -1100,6 +1103,37 @@ mod tests {
         assert!(system.contains("Persistent memory"));
         assert!(system.contains("Lisbon"));
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[tokio::test]
+    async fn assembled_context_does_not_leak_another_session_memory() {
+        let temp = TempDb::new();
+        let a = temp.db.create_session("a").unwrap();
+        let b = temp.db.create_session("b").unwrap();
+        temp.db
+            .add_memory(&a.id, "user's study area is Lisbon")
+            .unwrap();
+        temp.db
+            .add_memory(&b.id, "user's study area is Porto")
+            .unwrap();
+
+        let messages_b = assemble(&temp.db, &b.id, "be useful", |_older| async move {
+            panic!("no summarization for a short history")
+        })
+        .await
+        .unwrap();
+        let system_b = messages_b[0].content.as_deref().unwrap();
+        assert!(system_b.contains("Porto"));
+        assert!(!system_b.contains("Lisbon"));
+
+        let messages_a = assemble(&temp.db, &a.id, "be useful", |_older| async move {
+            panic!("no summarization for a short history")
+        })
+        .await
+        .unwrap();
+        let system_a = messages_a[0].content.as_deref().unwrap();
+        assert!(system_a.contains("Lisbon"));
+        assert!(!system_a.contains("Porto"));
     }
 
     #[tokio::test]

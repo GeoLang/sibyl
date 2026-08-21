@@ -7,6 +7,7 @@ mod salvage;
 mod sessions;
 mod tools;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,7 +33,9 @@ pub struct AppState {
     pub models: Arc<Models>,
     pub catalog: Arc<ToolCatalog>,
     pub limits: RunLimits,
-    pub run_lock: Arc<Mutex<()>>,
+    /// one mutex per session id, so two runs on different threads overlap and
+    /// two runs on the same thread still cannot interleave
+    pub session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// compose files pass unset vars through as `${VAR:-}`, so an empty or blank
@@ -144,7 +147,7 @@ async fn main() -> Result<()> {
             tool_timeout,
         )),
         limits,
-        run_lock: Arc::new(Mutex::new(())),
+        session_locks: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()

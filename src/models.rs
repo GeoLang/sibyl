@@ -433,7 +433,7 @@ mod tests {
                     Duration::from_secs(1),
                 )),
                 limits: RunLimits::default(),
-                run_lock: Arc::new(tokio::sync::Mutex::new(())),
+                session_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             }
         }
 

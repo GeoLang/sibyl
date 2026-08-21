@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
@@ -525,6 +525,16 @@ impl Stream for GuardedStream {
     }
 }
 
+async fn lock_for_session(
+    locks: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    session_id: &str,
+) -> Arc<Mutex<()>> {
+    let mut map = locks.lock().await;
+    map.entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn resolve_session(db: &Db, thread_id: Option<&str>) -> Result<crate::db::Session> {
     if let Some(id) = thread_id.filter(|s| !s.is_empty()) {
         return db.get_or_create_session(id, "Default");
@@ -540,7 +550,6 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
     let sink = EventSink::new(tx);
 
     let task = tokio::spawn(async move {
-        let _guard = state.run_lock.clone().lock_owned().await;
         let session = match resolve_session(&state.db, req.thread_id.as_deref()) {
             Ok(session) => Some(session),
             Err(err) => {
@@ -549,6 +558,10 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
             }
         };
         let Some(session) = session else { return };
+        let _guard = lock_for_session(&state.session_locks, &session.id)
+            .await
+            .lock_owned()
+            .await;
         if let Err(err) = state
             .db
             .append_message(&session.id, &NewMessage::user(req.message.clone()))
@@ -604,6 +617,26 @@ mod tests {
         assert_eq!(resolved.id, "tab-a");
         assert_eq!(temp.db.active_session().unwrap().unwrap().id, active.id);
         assert_eq!(resolve_session(&temp.db, None).unwrap().id, active.id);
+    }
+
+    #[tokio::test]
+    async fn different_sessions_do_not_share_a_run_lock() {
+        let locks = Mutex::new(HashMap::new());
+        let a = lock_for_session(&locks, "a").await;
+        let b = lock_for_session(&locks, "b").await;
+        assert!(!Arc::ptr_eq(&a, &b));
+        let _held = a.lock().await;
+        assert!(b.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_same_session_serializes() {
+        let locks = Mutex::new(HashMap::new());
+        let first = lock_for_session(&locks, "a").await;
+        let second = lock_for_session(&locks, "a").await;
+        assert!(Arc::ptr_eq(&first, &second));
+        let _held = first.lock().await;
+        assert!(second.try_lock().is_err());
     }
 
     #[test]

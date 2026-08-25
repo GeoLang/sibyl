@@ -19,6 +19,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-25: **a run can name the map the asker is looking at**. `POST /runs`
+  takes an optional `document`, and every tool call of that run carries it as
+  `X-Agora-Document` beside the bearer, so a tool that reads a live map answers
+  about the one on screen. Absent or empty sends no header.
+
 - 2026-08-25: **sessions have an owner**. sibyl reads `PLATFORM_JWT_SECRET`, the
   same HS256 platform secret every other service validates with, and refuses to
   start without it unless `SIBYL_ALLOW_UNAUTHENTICATED` is set to `1`, `true`,

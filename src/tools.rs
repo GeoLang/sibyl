@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const MANIFEST_TTL: Duration = Duration::from_secs(60);
+/// names the live map to the executor, which binds it for the length of the call
+const DOCUMENT_HEADER: &str = "X-Agora-Document";
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -85,8 +87,14 @@ impl ToolCatalog {
     }
 
     /// runs a tool, returning the result string or a failure marker to hand back to the model
-    pub async fn execute(&self, name: &str, raw_args: &str, user: Option<&UserToken>) -> String {
-        match self.try_execute(name, raw_args, user).await {
+    pub async fn execute(
+        &self,
+        name: &str,
+        raw_args: &str,
+        user: Option<&UserToken>,
+        document: Option<&str>,
+    ) -> String {
+        match self.try_execute(name, raw_args, user, document).await {
             Ok(result) => result,
             Err(err) => format!("❌ Tool execution failed: {err}"),
         }
@@ -97,6 +105,7 @@ impl ToolCatalog {
         name: &str,
         raw_args: &str,
         user: Option<&UserToken>,
+        document: Option<&str>,
     ) -> Result<String> {
         let args: Value = if raw_args.trim().is_empty() {
             json!({})
@@ -112,6 +121,9 @@ impl ToolCatalog {
         // unauthenticated rather than falling back to anything of its own
         if let Some(user) = user.filter(|u| !u.0.is_empty()) {
             request = request.bearer_auth(&user.0);
+        }
+        if let Some(document) = document.filter(|d| !d.is_empty()) {
+            request = request.header(DOCUMENT_HEADER, document);
         }
         let response = request.send().await?;
         let status = response.status();
@@ -144,10 +156,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    type SeenHeaders = Arc<Mutex<axum::http::HeaderMap>>;
+
+    fn header(seen: &SeenHeaders, name: &str) -> Option<String> {
+        seen.lock()
+            .expect("seen")
+            .get(name)
+            .map(|v| v.to_str().expect("header").to_string())
+    }
+
     /// a stand-in executor that answers /tools/{name} and reports back the
-    /// Authorization header it was called with
-    async fn executor() -> (String, Arc<Mutex<Option<String>>>) {
-        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    /// headers it was called with
+    async fn executor() -> (String, SeenHeaders) {
+        let seen: SeenHeaders = Arc::new(Mutex::new(axum::http::HeaderMap::new()));
         let handler_seen = seen.clone();
 
         let app = axum::Router::new().route(
@@ -155,9 +176,7 @@ mod tests {
             axum::routing::post(move |headers: axum::http::HeaderMap| {
                 let seen = handler_seen.clone();
                 async move {
-                    *seen.lock().expect("seen") = headers
-                        .get("authorization")
-                        .map(|v| v.to_str().expect("header").to_string());
+                    *seen.lock().expect("seen") = headers;
                     axum::Json(json!({"result": "ok"}))
                 }
             }),
@@ -180,11 +199,11 @@ mod tests {
         let token = UserToken("header.payload.signature".into());
 
         let result = catalog(base_url)
-            .execute("geocode_place", "{}", Some(&token))
+            .execute("geocode_place", "{}", Some(&token), None)
             .await;
         assert_eq!(result, "ok");
         assert_eq!(
-            seen.lock().unwrap().as_deref(),
+            header(&seen, "authorization").as_deref(),
             Some("Bearer header.payload.signature")
         );
     }
@@ -194,9 +213,11 @@ mod tests {
     async fn no_token_means_no_header() {
         let (base_url, seen) = executor().await;
 
-        let result = catalog(base_url).execute("geocode_place", "{}", None).await;
+        let result = catalog(base_url)
+            .execute("geocode_place", "{}", None, None)
+            .await;
         assert_eq!(result, "ok");
-        assert_eq!(seen.lock().unwrap().as_deref(), None);
+        assert_eq!(header(&seen, "authorization"), None);
     }
 
     #[tokio::test]
@@ -205,9 +226,30 @@ mod tests {
         let token = UserToken(String::new());
 
         catalog(base_url)
-            .execute("geocode_place", "{}", Some(&token))
+            .execute("geocode_place", "{}", Some(&token), None)
             .await;
-        assert_eq!(seen.lock().unwrap().as_deref(), None);
+        assert_eq!(header(&seen, "authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn the_document_rides_along_as_a_header() {
+        let (base_url, seen) = executor().await;
+
+        let result = catalog(base_url)
+            .execute("asset_readings", "{}", None, Some("doc-1"))
+            .await;
+        assert_eq!(result, "ok");
+        assert_eq!(header(&seen, DOCUMENT_HEADER).as_deref(), Some("doc-1"));
+    }
+
+    #[tokio::test]
+    async fn no_document_means_no_header() {
+        let (base_url, seen) = executor().await;
+
+        catalog(base_url)
+            .execute("asset_readings", "{}", None, Some(""))
+            .await;
+        assert_eq!(header(&seen, DOCUMENT_HEADER), None);
     }
 
     #[test]

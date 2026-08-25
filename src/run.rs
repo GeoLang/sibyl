@@ -93,6 +93,10 @@ pub struct RunRequest {
     /// own active session.
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// the agora document the asker is looking at, sent as `X-Agora-Document`
+    /// on every tool call of this run so a tool can read that map's state.
+    #[serde(default)]
+    pub document: Option<String>,
 }
 
 /// per-run ceilings, both operator-tunable. the wall clock one exists because a
@@ -489,6 +493,7 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
                 let catalog = state.catalog.clone();
                 let db = state.db.clone();
                 let user_token = req.user_token.clone();
+                let document = req.document.clone();
                 let session_id = session_id.to_string();
                 async move {
                     // memory tools are sibyl-native: they live in sibyl's db,
@@ -496,7 +501,9 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
                     if let Some(result) = crate::memory::execute(&db, &session_id, &name, &args) {
                         return result;
                     }
-                    catalog.execute(&name, &args, user_token.as_ref()).await
+                    catalog
+                        .execute(&name, &args, user_token.as_ref(), document.as_deref())
+                        .await
                 }
             },
         )
@@ -624,6 +631,23 @@ mod tests {
             serde_json::from_str(r#"{"system_prompt":"s","message":"m","thread_id":"sess-1"}"#)
                 .unwrap();
         assert_eq!(threaded.thread_id.as_deref(), Some("sess-1"));
+    }
+
+    /// only a caller looking at a map sends one
+    #[test]
+    fn the_document_is_optional_on_a_run_request() {
+        let mapless: RunRequest =
+            serde_json::from_str(r#"{"system_prompt":"s","message":"m"}"#).unwrap();
+        assert!(mapless.document.is_none());
+
+        let bound: RunRequest = serde_json::from_str(
+            r#"{"system_prompt":"s","message":"m","document":"3f2504e0-4f89-11d3-9a0c-0305e82c3301"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bound.document.as_deref(),
+            Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301")
+        );
     }
 
     #[test]

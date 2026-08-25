@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-25: **an agora feed token is refused as a session bearer**. `subject`
+  already rejected `token_use` and `geolang_use`, and now rejects `agora_use`
+  with any value. agora mints a long lived feed token signed with the same
+  `PLATFORM_JWT_SECRET` and carrying no `role`, so before this it opened
+  sessions owned by the feed's uuid.
+
 - 2026-08-25: **jsonwebtoken 9 to 11 on the `aws_lc_rs` backend**, the same
   crypto crate reqwest's rustls already pulls in. Only HS256 `encode`,
   `decode`, `from_secret` and `Validation::default()` are used, and 11 keeps

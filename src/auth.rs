@@ -26,8 +26,8 @@ pub fn truthy(value: Option<String>) -> bool {
     value.is_some_and(|value| TRUTHY.contains(&value.trim().to_ascii_lowercase().as_str()))
 }
 
-/// geolang's markers for a token that is not a plain platform bearer: a
-/// short scoped tool credential, and one minted for its `/mcp` door
+/// markers for a token scoped to one door of another service: geolang's short
+/// tool credential and its `/mcp` door, agora's sensor feed
 #[derive(Deserialize)]
 struct TokenClaims {
     sub: String,
@@ -35,6 +35,8 @@ struct TokenClaims {
     token_use: Option<String>,
     #[serde(default)]
     geolang_use: Option<String>,
+    #[serde(default)]
+    agora_use: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,9 +112,10 @@ impl Auth {
         if claims.sub.is_empty() {
             return Err(AuthError::Invalid);
         }
-        // a token minted for another door of geolang is not a session bearer,
+        // a token minted for another service's door is not a session bearer,
         // and the executor holds the tool ones
-        if claims.token_use.is_some() || claims.geolang_use.is_some() {
+        if claims.token_use.is_some() || claims.geolang_use.is_some() || claims.agora_use.is_some()
+        {
             return Err(AuthError::Invalid);
         }
         Ok(Some(claims.sub))
@@ -249,6 +252,19 @@ mod tests {
             "source_role": "editor",
         }));
         assert_eq!(platform().subject(Some(&mcp)), Err(AuthError::Invalid));
+    }
+
+    /// agora mints these for its sensor ingest socket, signed with the same
+    /// platform secret and carrying no role
+    #[test]
+    fn an_agora_feed_token_is_not_a_session_bearer() {
+        let feed = signed(json!({
+            "sub": "3f2a6c1e-0b7d-4c3a-9a1f-2d5e8b4c7a90",
+            "exp": 3_000_000_000i64,
+            "doc": "9c4b1d7e-5a2f-4e8b-b3c6-1f0a7d9e2c48",
+            "agora_use": "feed",
+        }));
+        assert_eq!(platform().subject(Some(&feed)), Err(AuthError::Invalid));
     }
 
     #[test]

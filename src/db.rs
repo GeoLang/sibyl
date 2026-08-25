@@ -13,6 +13,10 @@ pub struct Session {
     pub name: String,
     pub created_at: String,
     pub active: bool,
+    /// the verified `sub` of whoever created it, NULL when sibyl runs with no
+    /// gate and on rows that predate the column
+    #[serde(skip)]
+    pub subject: Option<String>,
     #[serde(skip)]
     pub summary: Option<String>,
     #[serde(skip)]
@@ -114,6 +118,7 @@ impl Db {
                 value TEXT NOT NULL
             );",
         )?;
+        migrate_sessions(&conn)?;
         migrate_memories(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -124,23 +129,39 @@ impl Db {
         self.conn.lock().expect("db mutex poisoned")
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<Session>> {
+    pub fn list_sessions(&self, subject: Option<&str>) -> Result<Vec<Session>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, created_at, active, summary, summary_watermark
-             FROM sessions ORDER BY created_at DESC, rowid DESC",
+            "SELECT id, name, created_at, active, summary, summary_watermark, subject
+             FROM sessions WHERE subject IS ?1 ORDER BY created_at DESC, rowid DESC",
         )?;
         let rows = stmt
-            .query_map([], row_to_session)?
+            .query_map(params![subject], row_to_session)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
+    /// the session `subject` owns under `id`. A row owned by anyone else reads
+    /// as absent, so an id cannot be probed
+    pub fn get_session(&self, id: &str, subject: Option<&str>) -> Result<Option<Session>> {
         let conn = self.conn();
         let session = conn
             .query_row(
-                "SELECT id, name, created_at, active, summary, summary_watermark
+                "SELECT id, name, created_at, active, summary, summary_watermark, subject
+                 FROM sessions WHERE id = ?1 AND subject IS ?2",
+                params![id, subject],
+                row_to_session,
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// no ownership check: for callers that already resolved the session
+    pub fn session_row(&self, id: &str) -> Result<Option<Session>> {
+        let conn = self.conn();
+        let session = conn
+            .query_row(
+                "SELECT id, name, created_at, active, summary, summary_watermark, subject
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -149,90 +170,116 @@ impl Db {
         Ok(session)
     }
 
-    pub fn active_session(&self) -> Result<Option<Session>> {
+    pub fn active_session(&self, subject: Option<&str>) -> Result<Option<Session>> {
         let conn = self.conn();
         let session = conn
             .query_row(
-                "SELECT id, name, created_at, active, summary, summary_watermark
-                 FROM sessions WHERE active = 1 LIMIT 1",
-                [],
+                "SELECT id, name, created_at, active, summary, summary_watermark, subject
+                 FROM sessions WHERE active = 1 AND subject IS ?1 LIMIT 1",
+                params![subject],
                 row_to_session,
             )
             .optional()?;
         Ok(session)
     }
 
-    /// creates a session and makes it the only active one
-    pub fn create_session(&self, name: &str) -> Result<Session> {
+    /// creates a session and makes it the only active one of that subject
+    pub fn create_session(&self, name: &str, subject: Option<&str>) -> Result<Session> {
         let session = Session {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             created_at: now(),
             active: true,
+            subject: subject.map(str::to_string),
             summary: None,
             summary_watermark: 0,
         };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute("UPDATE sessions SET active = 0", [])?;
         tx.execute(
-            "INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark)
-             VALUES (?1, ?2, ?3, 1, NULL, 0)",
-            params![session.id, session.name, session.created_at],
+            "UPDATE sessions SET active = 0 WHERE subject IS ?1",
+            params![subject],
+        )?;
+        tx.execute(
+            "INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark, subject)
+             VALUES (?1, ?2, ?3, 1, NULL, 0, ?4)",
+            params![session.id, session.name, session.created_at, subject],
         )?;
         tx.commit()?;
         Ok(session)
     }
 
-    /// look up `id`, or insert it without touching the active flag
-    pub fn get_or_create_session(&self, id: &str, name: &str) -> Result<Session> {
-        if let Some(session) = self.get_session(id)? {
-            return Ok(session);
+    /// look up `id`, or insert it under `subject` without touching the active
+    /// flag. None when the id is already someone else's
+    pub fn get_or_create_session(
+        &self,
+        id: &str,
+        name: &str,
+        subject: Option<&str>,
+    ) -> Result<Option<Session>> {
+        if let Some(session) = self.session_row(id)? {
+            if session.subject.as_deref() != subject {
+                return Ok(None);
+            }
+            return Ok(Some(session));
         }
         let session = Session {
             id: id.to_string(),
             name: name.to_string(),
             created_at: now(),
             active: false,
+            subject: subject.map(str::to_string),
             summary: None,
             summary_watermark: 0,
         };
         self.conn().execute(
-            "INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark)
-             VALUES (?1, ?2, ?3, 0, NULL, 0)",
-            params![session.id, session.name, session.created_at],
+            "INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark, subject)
+             VALUES (?1, ?2, ?3, 0, NULL, 0, ?4)",
+            params![session.id, session.name, session.created_at, subject],
         )?;
-        Ok(session)
+        Ok(Some(session))
     }
 
-    pub fn activate_session(&self, id: &str) -> Result<Option<Session>> {
+    pub fn activate_session(&self, id: &str, subject: Option<&str>) -> Result<Option<Session>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let updated = tx.execute("UPDATE sessions SET active = 1 WHERE id = ?1", params![id])?;
-        if updated == 0 {
-            return Ok(None);
-        }
-        tx.execute("UPDATE sessions SET active = 0 WHERE id != ?1", params![id])?;
-        tx.commit()?;
-        drop(conn);
-        self.get_session(id)
-    }
-
-    pub fn rename_session(&self, id: &str, name: &str) -> Result<Option<Session>> {
-        let updated = self.conn().execute(
-            "UPDATE sessions SET name = ?2 WHERE id = ?1",
-            params![id, name],
+        let updated = tx.execute(
+            "UPDATE sessions SET active = 1 WHERE id = ?1 AND subject IS ?2",
+            params![id, subject],
         )?;
         if updated == 0 {
             return Ok(None);
         }
-        self.get_session(id)
+        tx.execute(
+            "UPDATE sessions SET active = 0 WHERE id != ?1 AND subject IS ?2",
+            params![id, subject],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_session(id, subject)
     }
 
-    pub fn delete_session(&self, id: &str) -> Result<bool> {
-        let deleted = self
-            .conn()
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    pub fn rename_session(
+        &self,
+        id: &str,
+        name: &str,
+        subject: Option<&str>,
+    ) -> Result<Option<Session>> {
+        let updated = self.conn().execute(
+            "UPDATE sessions SET name = ?2 WHERE id = ?1 AND subject IS ?3",
+            params![id, name, subject],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_session(id, subject)
+    }
+
+    pub fn delete_session(&self, id: &str, subject: Option<&str>) -> Result<bool> {
+        let deleted = self.conn().execute(
+            "DELETE FROM sessions WHERE id = ?1 AND subject IS ?2",
+            params![id, subject],
+        )?;
         Ok(deleted > 0)
     }
 
@@ -351,21 +398,31 @@ pub struct Memory {
     pub created_at: String,
 }
 
-fn memories_have_session_id(conn: &Connection) -> Result<bool> {
-    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    // a pragma argument cannot be bound, and both tables are named in this file
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let name: String = row.get(1)?;
-        if name == "session_id" {
+        if name == column {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
+fn migrate_sessions(conn: &Connection) -> Result<()> {
+    // rows from before sessions had an owner keep a NULL subject, which no
+    // authenticated caller matches
+    if !has_column(conn, "sessions", "subject")? {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN subject TEXT;")?;
+    }
+    Ok(())
+}
+
 fn migrate_memories(conn: &Connection) -> Result<()> {
     // old memories had no session and leaked across users; drop them
-    if !memories_have_session_id(conn)? {
+    if !has_column(conn, "memories", "session_id")? {
         conn.execute_batch("DROP TABLE IF EXISTS memories;")?;
     }
     conn.execute_batch(
@@ -388,6 +445,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         active: row.get::<_, i64>(3)? != 0,
         summary: row.get(4)?,
         summary_watermark: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        subject: row.get(6)?,
     })
 }
 
@@ -432,30 +490,42 @@ mod tests {
     #[test]
     fn create_activates_and_deactivates_others() {
         let temp = TempDb::new();
-        let first = temp.db.create_session("first").unwrap();
-        let second = temp.db.create_session("second").unwrap();
+        let first = temp.db.create_session("first", None).unwrap();
+        let second = temp.db.create_session("second", None).unwrap();
 
-        let active = temp.db.active_session().unwrap().unwrap();
+        let active = temp.db.active_session(None).unwrap().unwrap();
         assert_eq!(active.id, second.id);
-        assert!(!temp.db.get_session(&first.id).unwrap().unwrap().active);
+        assert!(
+            !temp
+                .db
+                .get_session(&first.id, None)
+                .unwrap()
+                .unwrap()
+                .active
+        );
 
-        let activated = temp.db.activate_session(&first.id).unwrap().unwrap();
+        let activated = temp.db.activate_session(&first.id, None).unwrap().unwrap();
         assert!(activated.active);
-        assert_eq!(temp.db.active_session().unwrap().unwrap().id, first.id);
-        assert!(temp.db.activate_session("missing").unwrap().is_none());
+        assert_eq!(temp.db.active_session(None).unwrap().unwrap().id, first.id);
+        assert!(temp.db.activate_session("missing", None).unwrap().is_none());
     }
 
     #[test]
     fn get_or_create_does_not_steal_active() {
         let temp = TempDb::new();
-        let first = temp.db.create_session("first").unwrap();
-        let other = temp.db.get_or_create_session("thread-a", "tab").unwrap();
+        let first = temp.db.create_session("first", None).unwrap();
+        let other = temp
+            .db
+            .get_or_create_session("thread-a", "tab", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(other.id, "thread-a");
         assert!(!other.active);
-        assert_eq!(temp.db.active_session().unwrap().unwrap().id, first.id);
+        assert_eq!(temp.db.active_session(None).unwrap().unwrap().id, first.id);
         let again = temp
             .db
-            .get_or_create_session("thread-a", "ignored")
+            .get_or_create_session("thread-a", "ignored", None)
+            .unwrap()
             .unwrap();
         assert_eq!(again.id, other.id);
         assert_eq!(again.name, "tab");
@@ -464,27 +534,32 @@ mod tests {
     #[test]
     fn list_is_newest_first_and_rename_sticks() {
         let temp = TempDb::new();
-        let first = temp.db.create_session("first").unwrap();
-        let second = temp.db.create_session("second").unwrap();
+        let first = temp.db.create_session("first", None).unwrap();
+        let second = temp.db.create_session("second", None).unwrap();
 
-        let listed = temp.db.list_sessions().unwrap();
+        let listed = temp.db.list_sessions(None).unwrap();
         assert_eq!(
             listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec![second.id.as_str(), first.id.as_str()]
         );
 
-        temp.db.rename_session(&first.id, "renamed").unwrap();
+        temp.db.rename_session(&first.id, "renamed", None).unwrap();
         assert_eq!(
-            temp.db.get_session(&first.id).unwrap().unwrap().name,
+            temp.db.get_session(&first.id, None).unwrap().unwrap().name,
             "renamed"
         );
-        assert!(temp.db.rename_session("missing", "x").unwrap().is_none());
+        assert!(
+            temp.db
+                .rename_session("missing", "x", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn delete_removes_session_and_its_messages() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("gone").unwrap();
+        let session = temp.db.create_session("gone", None).unwrap();
         temp.db
             .append_message(&session.id, &NewMessage::user("hello"))
             .unwrap();
@@ -492,17 +567,134 @@ mod tests {
             .add_memory(&session.id, "a fact that should go with the session")
             .unwrap();
 
-        assert!(temp.db.delete_session(&session.id).unwrap());
-        assert!(temp.db.get_session(&session.id).unwrap().is_none());
+        assert!(temp.db.delete_session(&session.id, None).unwrap());
+        assert!(temp.db.get_session(&session.id, None).unwrap().is_none());
         assert!(temp.db.messages_after(&session.id, 0).unwrap().is_empty());
         assert!(temp.db.list_memories(&session.id, 50).unwrap().is_empty());
-        assert!(!temp.db.delete_session(&session.id).unwrap());
+        assert!(!temp.db.delete_session(&session.id, None).unwrap());
+    }
+
+    #[test]
+    fn each_subject_has_its_own_active_session() {
+        let temp = TempDb::new();
+        let mine = temp.db.create_session("mine", Some("alice")).unwrap();
+        let theirs = temp.db.create_session("theirs", Some("bob")).unwrap();
+
+        assert_eq!(
+            temp.db.active_session(Some("alice")).unwrap().unwrap().id,
+            mine.id
+        );
+        assert_eq!(
+            temp.db.active_session(Some("bob")).unwrap().unwrap().id,
+            theirs.id
+        );
+        assert!(temp.db.active_session(None).unwrap().is_none());
+
+        let second = temp.db.create_session("second", Some("alice")).unwrap();
+        assert_eq!(
+            temp.db.active_session(Some("alice")).unwrap().unwrap().id,
+            second.id
+        );
+        // bob's stays where it was: creating is not a process-wide switch
+        assert_eq!(
+            temp.db.active_session(Some("bob")).unwrap().unwrap().id,
+            theirs.id
+        );
+
+        temp.db.activate_session(&mine.id, Some("alice")).unwrap();
+        assert_eq!(
+            temp.db.active_session(Some("bob")).unwrap().unwrap().id,
+            theirs.id
+        );
+    }
+
+    #[test]
+    fn a_foreign_subject_sees_nothing_and_changes_nothing() {
+        let temp = TempDb::new();
+        let mine = temp.db.create_session("mine", Some("alice")).unwrap();
+        temp.db.create_session("theirs", Some("bob")).unwrap();
+
+        let listed = temp.db.list_sessions(Some("bob")).unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["theirs"]
+        );
+        assert!(temp.db.list_sessions(None).unwrap().is_empty());
+
+        assert!(
+            temp.db
+                .get_session(&mine.id, Some("bob"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            temp.db
+                .activate_session(&mine.id, Some("bob"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            temp.db
+                .rename_session(&mine.id, "stolen", Some("bob"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!temp.db.delete_session(&mine.id, Some("bob")).unwrap());
+        assert!(
+            temp.db
+                .get_or_create_session(&mine.id, "stolen", Some("bob"))
+                .unwrap()
+                .is_none()
+        );
+
+        let untouched = temp
+            .db
+            .get_session(&mine.id, Some("alice"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.name, "mine");
+        assert!(untouched.active);
+    }
+
+    /// sessions written before the column exists keep a NULL subject, which no
+    /// authenticated caller matches
+    #[test]
+    fn a_session_from_before_the_column_has_no_owner() {
+        let path = std::env::temp_dir()
+            .join("sibyl-tests")
+            .join(format!("{}.db", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT,
+                    summary_watermark INTEGER
+                );
+                INSERT INTO sessions (id, name, created_at, active, summary, summary_watermark)
+                VALUES ('old', 'before owners', '2020-01-01T00:00:00Z', 1, NULL, 0);",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert!(db.get_session("old", Some("alice")).unwrap().is_none());
+        assert!(db.list_sessions(Some("alice")).unwrap().is_empty());
+        assert_eq!(
+            db.get_session("old", None).unwrap().unwrap().name,
+            "before owners"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn messages_append_in_order_and_respect_the_watermark() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         temp.db
             .append_message(&session.id, &NewMessage::user("one"))
             .unwrap();
@@ -551,10 +743,10 @@ mod tests {
     #[test]
     fn summary_round_trips() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         temp.db.set_summary(&session.id, "earlier work", 7).unwrap();
 
-        let stored = temp.db.get_session(&session.id).unwrap().unwrap();
+        let stored = temp.db.get_session(&session.id, None).unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("earlier work"));
         assert_eq!(stored.summary_watermark, 7);
     }
@@ -562,8 +754,8 @@ mod tests {
     #[test]
     fn memories_are_scoped_to_a_session() {
         let temp = TempDb::new();
-        let a = temp.db.create_session("a").unwrap();
-        let b = temp.db.create_session("b").unwrap();
+        let a = temp.db.create_session("a", None).unwrap();
+        let b = temp.db.create_session("b", None).unwrap();
         temp.db.add_memory(&a.id, "lisbon").unwrap();
         temp.db.add_memory(&b.id, "porto").unwrap();
 
@@ -613,7 +805,7 @@ mod tests {
         }
 
         let db = Db::open(&path).unwrap();
-        let session = db.create_session("chat").unwrap();
+        let session = db.create_session("chat", None).unwrap();
         assert!(db.list_memories(&session.id, 50).unwrap().is_empty());
         db.add_memory(&session.id, "stays in this session").unwrap();
         assert_eq!(

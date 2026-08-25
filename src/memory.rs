@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn save_then_inject_then_forget_round_trip() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
 
         let saved = execute(
             &temp.db,
@@ -142,8 +142,8 @@ mod tests {
     #[test]
     fn memories_stay_inside_their_session() {
         let temp = TempDb::new();
-        let a = temp.db.create_session("a").unwrap();
-        let b = temp.db.create_session("b").unwrap();
+        let a = temp.db.create_session("a", None).unwrap();
+        let b = temp.db.create_session("b", None).unwrap();
 
         execute(
             &temp.db,
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn bad_arguments_return_errors_not_panics() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         assert!(
             execute(&temp.db, &session.id, SAVE_MEMORY, "{}")
                 .unwrap()
@@ -197,14 +197,14 @@ mod tests {
     #[test]
     fn unknown_tools_pass_through() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         assert!(execute(&temp.db, &session.id, "geocode_place", "{}").is_none());
     }
 
     #[test]
     fn forgetting_something_never_saved_is_not_an_error() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let result = execute(
             &temp.db,
             &session.id,

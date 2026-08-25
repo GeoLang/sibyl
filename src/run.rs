@@ -83,12 +83,14 @@ impl EventSink {
 pub struct RunRequest {
     pub system_prompt: String,
     pub message: String,
-    /// bearer token of the person asking, forwarded to every tool call of this
-    /// run. absent for headless runs, which then call services anonymously.
+    /// bearer token of the person asking. it names the session owner and is
+    /// forwarded to every tool call of this run. With `PLATFORM_JWT_SECRET` set
+    /// a run without it is refused, and without the secret it is optional and
+    /// the tools call services anonymously.
     #[serde(default)]
     pub user_token: Option<UserToken>,
-    /// AG-UI thread, used as the session id. absent falls back to the
-    /// process-wide active session.
+    /// AG-UI thread, used as the session id. absent falls back to the caller's
+    /// own active session.
     #[serde(default)]
     pub thread_id: Option<String>,
 }
@@ -263,7 +265,7 @@ where
     Fut: Future<Output = Result<String>>,
 {
     let session = db
-        .get_session(session_id)?
+        .session_row(session_id)?
         .context("session disappeared mid run")?;
     let history = db.messages_after(session_id, session.summary_watermark)?;
     let memories = crate::memory::context_block(db, session_id);
@@ -535,22 +537,37 @@ async fn lock_for_session(
         .clone()
 }
 
-fn resolve_session(db: &Db, thread_id: Option<&str>) -> Result<crate::db::Session> {
+fn resolve_session(
+    db: &Db,
+    thread_id: Option<&str>,
+    subject: Option<&str>,
+) -> Result<crate::db::Session> {
     if let Some(id) = thread_id.filter(|s| !s.is_empty()) {
-        return db.get_or_create_session(id, "Default");
+        return db
+            .get_or_create_session(id, "Default", subject)?
+            .context("session not found");
     }
-    match db.active_session()? {
+    match db.active_session(subject)? {
         Some(session) => Ok(session),
-        None => db.create_session("Default"),
+        None => db.create_session("Default", subject),
     }
 }
 
 pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
+    let subject = match state
+        .auth
+        .subject(req.user_token.as_ref().map(UserToken::as_str))
+    {
+        Ok(subject) => subject,
+        Err(err) => return err.into_response(),
+    };
+
     let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(64);
     let sink = EventSink::new(tx);
 
     let task = tokio::spawn(async move {
-        let session = match resolve_session(&state.db, req.thread_id.as_deref()) {
+        let session = match resolve_session(&state.db, req.thread_id.as_deref(), subject.as_deref())
+        {
             Ok(session) => Some(session),
             Err(err) => {
                 sink.fail(err).await;
@@ -612,11 +629,32 @@ mod tests {
     #[test]
     fn resolve_session_uses_thread_id_without_touching_active() {
         let temp = TempDb::new();
-        let active = temp.db.create_session("active").unwrap();
-        let resolved = resolve_session(&temp.db, Some("tab-a")).unwrap();
+        let active = temp.db.create_session("active", None).unwrap();
+        let resolved = resolve_session(&temp.db, Some("tab-a"), None).unwrap();
         assert_eq!(resolved.id, "tab-a");
-        assert_eq!(temp.db.active_session().unwrap().unwrap().id, active.id);
-        assert_eq!(resolve_session(&temp.db, None).unwrap().id, active.id);
+        assert_eq!(temp.db.active_session(None).unwrap().unwrap().id, active.id);
+        assert_eq!(resolve_session(&temp.db, None, None).unwrap().id, active.id);
+    }
+
+    #[test]
+    fn a_run_cannot_name_another_subjects_thread() {
+        let temp = TempDb::new();
+        let mine = temp.db.create_session("mine", Some("alice")).unwrap();
+
+        let err = resolve_session(&temp.db, Some(&mine.id), Some("bob")).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        // bob still gets a session of his own when he names none
+        let fresh = resolve_session(&temp.db, None, Some("bob")).unwrap();
+        assert_eq!(fresh.subject.as_deref(), Some("bob"));
+        assert_eq!(
+            temp.db.active_session(Some("alice")).unwrap().unwrap().id,
+            mine.id
+        );
+        assert_eq!(
+            resolve_session(&temp.db, None, Some("bob")).unwrap().id,
+            fresh.id
+        );
     }
 
     #[tokio::test]
@@ -690,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_leaves_stops_the_run_before_the_next_model_call() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let (sink, rx) = sink_and_events();
         let names: HashSet<&str> = ["echo"].into_iter().collect();
 
@@ -737,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn a_connected_client_runs_until_the_call_cap() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let (sink, _rx) = sink_and_events();
         let names: HashSet<&str> = ["echo"].into_iter().collect();
 
@@ -843,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn content_only_response_emits_one_text_event() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let turn = Turn {
             text: Some("all done".into()),
             tool_calls: Vec::new(),
@@ -877,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_emit_call_then_return_in_order() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let turn = Turn {
             text: None,
             tool_calls: vec![
@@ -937,7 +975,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_response_emits_text_before_tool_events() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let turn = Turn {
             text: Some("looking it up".into()),
             tool_calls: vec![call("c1", "search", r#"{"q":"roads"}"#)],
@@ -970,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn a_thrice_repeated_failing_call_aborts_the_run() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         let turn = Turn {
             text: None,
             tool_calls: vec![
@@ -1029,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_summarizes_and_keeps_the_recent_window() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         seed_overflow(&temp.db, &session.id, 60);
 
         let messages = assemble(&temp.db, &session.id, "be useful", |older| async move {
@@ -1046,7 +1084,7 @@ mod tests {
         assert_eq!(messages.len(), 1 + KEEP_RECENT_MESSAGES);
         assert!(messages[1].content.as_deref().unwrap().starts_with("40 "));
 
-        let stored = temp.db.get_session(&session.id).unwrap().unwrap();
+        let stored = temp.db.get_session(&session.id, None).unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("canned summary"));
         let history = temp.db.messages_after(&session.id, 0).unwrap();
         assert_eq!(stored.summary_watermark, history[39].id);
@@ -1063,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn summary_merges_with_the_existing_one() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         temp.db.set_summary(&session.id, "earlier", 0).unwrap();
         seed_overflow(&temp.db, &session.id, 60);
 
@@ -1073,14 +1111,14 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = temp.db.get_session(&session.id).unwrap().unwrap();
+        let stored = temp.db.get_session(&session.id, None).unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("earlier\nlater"));
     }
 
     #[tokio::test]
     async fn failed_summary_drops_oldest_without_persisting() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         seed_overflow(&temp.db, &session.id, 60);
 
         let messages = assemble(&temp.db, &session.id, "be useful", |_older| async move {
@@ -1090,7 +1128,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(messages.len(), 1 + KEEP_RECENT_MESSAGES);
-        let stored = temp.db.get_session(&session.id).unwrap().unwrap();
+        let stored = temp.db.get_session(&session.id, None).unwrap().unwrap();
         assert!(stored.summary.is_none());
         assert_eq!(stored.summary_watermark, 0);
     }
@@ -1098,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn short_history_is_passed_through_untouched() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         temp.db
             .append_message(&session.id, &NewMessage::user("hi"))
             .unwrap();
@@ -1116,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn saved_memories_ride_along_as_a_system_message() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         temp.db
             .add_memory(&session.id, "user's study area is Lisbon")
             .unwrap();
@@ -1141,8 +1179,8 @@ mod tests {
     #[tokio::test]
     async fn assembled_context_does_not_leak_another_session_memory() {
         let temp = TempDb::new();
-        let a = temp.db.create_session("a").unwrap();
-        let b = temp.db.create_session("b").unwrap();
+        let a = temp.db.create_session("a", None).unwrap();
+        let b = temp.db.create_session("b", None).unwrap();
         temp.db
             .add_memory(&a.id, "user's study area is Lisbon")
             .unwrap();
@@ -1172,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn the_kept_window_never_starts_with_an_orphan_tool_result() {
         let temp = TempDb::new();
-        let session = temp.db.create_session("chat").unwrap();
+        let session = temp.db.create_session("chat", None).unwrap();
         seed_overflow(&temp.db, &session.id, 40);
         // the boundary lands on this tool result, whose assistant message gets summarized away
         temp.db

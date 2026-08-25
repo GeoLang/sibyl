@@ -432,6 +432,7 @@ mod tests {
                     "http://127.0.0.1:1".into(),
                     Duration::from_secs(1),
                 )),
+                auth: Arc::new(crate::auth::Auth::new(None, true).unwrap()),
                 limits: RunLimits::default(),
                 session_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             }

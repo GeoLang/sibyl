@@ -26,6 +26,12 @@ struct ToolSpec {
 #[serde(transparent)]
 pub struct UserToken(String);
 
+impl UserToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// redacted, so a `{:?}` on anything holding one cannot put it in a log line
 impl std::fmt::Debug for UserToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -7,6 +7,8 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | var | default | notes |
 | --- | --- | --- |
 | `XAI_API_KEY` | required on the default base | see below |
+| `PLATFORM_JWT_SECRET` | required | shared HS256 platform secret, see below |
+| `SIBYL_ALLOW_UNAUTHENTICATED` | unset | `1`/`true`/`yes`/`on` starts without the secret and leaves every session unowned |
 | `SIBYL_HOST` | `0.0.0.0` | |
 | `SIBYL_PORT` | `8090` | |
 | `SIBYL_DB_PATH` | `/data/sibyl.db` | parent dir is created |
@@ -20,6 +22,16 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | `SIBYL_THINKING` | unset | `1`/`true` asks the local llama-server for thinking per request (`chat_template_kwargs`) with qwen's thinking sampling, overriding its startup `--reasoning off`. Local profile only, cloud requests are untouched |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank the base URL or the model.
+
+### Who a session belongs to
+
+`PLATFORM_JWT_SECRET` is the shared HS256 secret the rest of the platform validates with, over `{sub, exp}` and no `aud`. The verified `sub` owns every session that caller creates: `GET /sessions` lists only theirs, the active session is theirs alone, and naming someone else's session id on any route answers 404 rather than 403, so ids cannot be probed.
+
+Only a plain platform bearer counts. A token carrying `token_use` or `geolang_use` is refused: geolang mints those for its own tool boundary and its `/mcp` door, and the tool ones are held by the executor that runs caller-written code.
+
+Starting without the secret takes `SIBYL_ALLOW_UNAUTHENTICATED=1`, which logs one line at startup and leaves every session unowned and reachable by anyone who can reach the port. That is the standalone stack and the eval harness, neither of which holds a token.
+
+Sessions written before sibyl had owners carry no subject, so no authenticated caller can reach them. They are still there for an unauthenticated start.
 
 ### Model profiles
 
@@ -112,17 +124,19 @@ For a dedicated always-on server on the remote box instead (a second loaded mode
 ## API
 
 - `GET /health` service liveness
-- `GET /sessions` sessions, newest first
+- `GET /sessions` the caller's sessions, newest first
 - `POST /sessions` `{"name"}`, creates and activates
-- `POST /sessions/{id}/activate` makes it the active session
+- `POST /sessions/{id}/activate` makes it the caller's active session
 - `PATCH /sessions/{id}` `{"name"}` renames
 - `DELETE /sessions/{id}` deletes, 400 if active
 - `POST /sessions/{id}/messages` `{"content"}` appends a user message without running the model
 - `GET /models` `{"active", "profiles":[{"id","label","model","available"}]}`
 - `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable
-- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the process-wide active session is used. `user_token` is the caller's bearer token, sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. Without it the tools call services unauthenticated.
+- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the caller's own active session is used, and one is created when they have none. A `thread_id` naming someone else's session ends the stream with an `error` event. `user_token` is the caller's bearer token: it names the session owner, and it is sent as `Authorization: Bearer` on every tool call of that run and kept in memory only.
 
-These endpoints are unauthenticated, like the rest of sibyl's API, which already exposes run execution: put it behind something that authenticates.
+Every `/sessions` route reads the bearer from the `Authorization` header, and `/runs` reads the same token from `user_token`. With `PLATFORM_JWT_SECRET` set, a missing or invalid one is a 401 with `{"error": ...}`. Without the secret nothing is checked and the tools call services unauthenticated.
+
+`/models`, `/model` and `/health` carry no gate: put sibyl behind something that authenticates if the model switch matters.
 
 A switch applies to the next run. A run already going finishes on the profile it started with.
 

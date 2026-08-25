@@ -1,3 +1,4 @@
+mod auth;
 mod db;
 mod llm;
 mod memory;
@@ -22,6 +23,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::Auth;
 use crate::db::Db;
 use crate::models::{ACTIVE_KEY, DEFAULT_MODEL, Models};
 use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
@@ -32,6 +34,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub models: Arc<Models>,
     pub catalog: Arc<ToolCatalog>,
+    pub auth: Arc<Auth>,
     pub limits: RunLimits,
     /// one mutex per session id, so two runs on different threads overlap and
     /// two runs on the same thread still cannot interleave
@@ -97,6 +100,18 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    let auth = Auth::new(
+        env_var(auth::SECRET_ENV),
+        auth::truthy(env_var(auth::UNAUTHENTICATED_ENV)),
+    )?;
+    if auth.unauthenticated() {
+        info!(
+            "{} is not set: sessions have no owner, so anyone who can reach this port can read, \
+             rename, delete and write into any of them",
+            auth::SECRET_ENV
+        );
+    }
+
     let host = env_or("SIBYL_HOST", "0.0.0.0");
     let port: u16 = env_parsed("SIBYL_PORT", 8090)?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
@@ -146,23 +161,12 @@ async fn main() -> Result<()> {
             geolang_url.trim_end_matches('/').to_string(),
             tool_timeout,
         )),
+        auth: Arc::new(auth),
         limits,
         session_locks: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/sessions", get(sessions::list).post(sessions::create))
-        .route(
-            "/sessions/{id}",
-            patch(sessions::rename).delete(sessions::delete),
-        )
-        .route("/sessions/{id}/activate", post(sessions::activate))
-        .route("/sessions/{id}/messages", post(sessions::add_message))
-        .route("/models", get(models::list))
-        .route("/model", put(models::switch))
-        .route("/runs", post(run::post_run))
-        .with_state(state);
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
@@ -175,8 +179,49 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/sessions", get(sessions::list).post(sessions::create))
+        .route(
+            "/sessions/{id}",
+            patch(sessions::rename).delete(sessions::delete),
+        )
+        .route("/sessions/{id}/activate", post(sessions::activate))
+        .route("/sessions/{id}/messages", post(sessions::add_message))
+        .route("/models", get(models::list))
+        .route("/model", put(models::switch))
+        .route("/runs", post(run::post_run))
+        .with_state(state)
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    /// a state whose model profile and tool catalog are never reached, for the
+    /// route tests
+    pub fn state(db: Arc<Db>, auth: Auth) -> AppState {
+        let http = reqwest::Client::new();
+        let specs = models::specs(Some("test-key".into()), None, DEFAULT_MODEL.into())
+            .expect("cloud profile from a key");
+        AppState {
+            db,
+            models: Arc::new(Models::new(&http, specs, None, None, false)),
+            catalog: Arc::new(ToolCatalog::new(
+                http,
+                "http://127.0.0.1:1".into(),
+                Duration::from_secs(1),
+            )),
+            auth: Arc::new(auth),
+            limits: RunLimits::default(),
+            session_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[cfg(test)]

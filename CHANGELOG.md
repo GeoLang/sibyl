@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-08-25: **jsonwebtoken 9 to 11 on the `aws_lc_rs` backend**, the same
+  crypto crate reqwest's rustls already pulls in. Only HS256 `encode`,
+  `decode`, `from_secret` and `Validation::default()` are used, and 11 keeps
+  `validate_aud` on by default, so a token carrying `aud` is still refused.
+
 ### Added
 
 - 2026-08-25: **sessions have an owner**. sibyl reads `PLATFORM_JWT_SECRET`, the

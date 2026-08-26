@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-26: **one switchable profile per model, on a cloud server and a local
+  one**. `XAI_API_KEY`, `SIBYL_API_BASE` and `SIBYL_MODEL` are gone, replaced by
+  `SIBYL_CLOUD_API_KEY`, `SIBYL_CLOUD_API_BASE` (default `https://api.x.ai/v1`),
+  `SIBYL_CLOUD_MODELS` (default `grok-4-1-fast-reasoning`),
+  `SIBYL_LOCAL_API_BASE` and `SIBYL_LOCAL_MODELS`. The two model lists are comma
+  separated and give one profile per entry, so the cloud server is no longer
+  pinned to x.ai and a local llama-server in router mode can serve several
+  models at once. A profile id is now `<server>:<model>` and its label is
+  `<model> (<server>)`, and `GET /models` carries a new `server` field of
+  `cloud` or `local`, listing local profiles first. A stored `active_model` of
+  `cloud` or `local` from an older build no longer names anything and falls back
+  to the default profile, the first local one or else the first cloud one.
+  Cloud profiles are listed even with no key, marked unavailable, so a viewer
+  can grey them out. Setting `SIBYL_LOCAL_API_BASE` without `SIBYL_LOCAL_MODELS`
+  or the other way round fails startup naming both, and so does having neither
+  a key nor a local base. `SIBYL_THINKING` still reaches local profiles only and
+  the cloud key still never goes to the local server.
+
 - 2026-08-25: **an agora feed token is refused as a session bearer**. `subject`
   already rejected `token_use` and `geolang_use`, and now rejects `agora_use`
   with any value. agora mints a long lived feed token signed with the same

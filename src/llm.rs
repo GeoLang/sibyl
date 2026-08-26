@@ -252,7 +252,7 @@ pub struct Client {
     /// none sends no `max_tokens` at all, leaving the server's own default alone
     max_tokens: Option<u32>,
     /// asks llama-server for thinking per request, overriding its startup
-    /// `--reasoning off`. only ever set on the local profile: the cloud api
+    /// `--reasoning off`. only ever set on a local profile: the cloud api
     /// does not know `chat_template_kwargs`.
     thinking: bool,
 }

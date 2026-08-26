@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::Auth;
 use crate::db::Db;
-use crate::models::{ACTIVE_KEY, DEFAULT_MODEL, Models};
+use crate::models::{ACTIVE_KEY, Models};
 use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
 use crate::tools::ToolCatalog;
 
@@ -115,14 +115,27 @@ async fn main() -> Result<()> {
     let host = env_or("SIBYL_HOST", "0.0.0.0");
     let port: u16 = env_parsed("SIBYL_PORT", 8090)?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
-    let model = env_or("SIBYL_MODEL", DEFAULT_MODEL);
-    let api_base = env_var("SIBYL_API_BASE").map(|base| base.trim_end_matches('/').to_string());
-    let specs = models::specs(env_var("XAI_API_KEY"), api_base, model)?;
-    if specs.cloud.is_none() {
-        info!("no XAI_API_KEY set, the cloud profile is unavailable");
+    let specs = models::specs(models::Config {
+        cloud_key: env_var(models::CLOUD_KEY_ENV),
+        cloud_base: env_or(models::CLOUD_BASE_ENV, models::DEFAULT_CLOUD_API_BASE),
+        cloud_models: env_or(models::CLOUD_MODELS_ENV, models::DEFAULT_CLOUD_MODELS),
+        local_base: env_var(models::LOCAL_BASE_ENV),
+        local_models: env_var(models::LOCAL_MODELS_ENV),
+    })?;
+    if specs
+        .iter()
+        .any(|spec| spec.server == models::Server::Cloud && spec.key.is_none())
+    {
+        info!(
+            "cloud profiles are unavailable, {} is not set",
+            models::CLOUD_KEY_ENV
+        );
     }
-    if let Some(local) = specs.local.as_ref().filter(|local| local.key.is_none()) {
-        info!("local profile calls {} without authentication", local.base);
+    if let Some(local) = specs
+        .iter()
+        .find(|spec| spec.server == models::Server::Local)
+    {
+        info!("local profiles call {} without authentication", local.base);
     }
     let geolang_url = env_or("GEOLANG_URL", "http://geolang-api:8080");
     let tool_timeout = Duration::from_secs(env_parsed("SIBYL_TOOL_TIMEOUT_SECS", 600u64)?);
@@ -131,7 +144,7 @@ async fn main() -> Result<()> {
     let thinking = env_var("SIBYL_THINKING")
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     if thinking {
-        info!("thinking enabled for the local profile");
+        info!("thinking enabled for the local profiles");
     }
     let limits = RunLimits {
         max_model_calls: env_parsed("SIBYL_MAX_MODEL_CALLS", DEFAULT_MAX_MODEL_CALLS)?,
@@ -207,8 +220,11 @@ pub mod testing {
     /// route tests
     pub fn state(db: Arc<Db>, auth: Auth) -> AppState {
         let http = reqwest::Client::new();
-        let specs = models::specs(Some("test-key".into()), None, DEFAULT_MODEL.into())
-            .expect("cloud profile from a key");
+        let specs = models::specs(models::Config {
+            cloud_key: Some("test-key".into()),
+            ..models::Config::default()
+        })
+        .expect("cloud profile from a key");
         AppState {
             db,
             models: Arc::new(Models::new(&http, specs, None, None, false)),

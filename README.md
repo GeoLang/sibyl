@@ -100,9 +100,11 @@ The router names each model after its GGUF filename with the `.gguf` dropped, an
 
 ```
 SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 \
-  SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M,gpt-oss-20b \
+  SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M,Qwen3.8-27B-Q4_K_M \
   SIBYL_DB_PATH=./sibyl.db cargo run
 ```
+
+Qwen 3.8 ships a 27B and no 9B, so the small model stays Qwen 3.5: `Qwen3.8-27B-Q4_K_M.gguf` is the bartowski Q4_K_M file (about 18 GB), and the 9B is the `Qwen3.5-9B-Q4_K_M.gguf` the liquid runtime already holds.
 
 The liquid runtime prefixes its downloads with a content hash, which is part of the filename and so part of the name: `03b74727a860-Qwen3.5-9B-Q4_K_M`. `GET /v1/models` on the router reports the exact ids.
 

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- 2026-08-28: **any number of cloud APIs and local servers.** Each is a named
+  provider with its own base, optional key and model list. Env still seeds the
+  `cloud` and `local` providers. `PUT /model/providers` adds or updates one,
+  `DELETE /model/providers/{id}` removes one, and `PUT /model/cloud` still
+  rewrites the `cloud` provider. `GET /models` includes a `providers` array
+  (base and `has_key`, never the key).
+- 2026-08-28: **cloud credentials can be rewritten at runtime.** `PUT /model/cloud`
+  takes optional `base`, `key` and `models`, stores them in sqlite (overriding
+  env on the next start), rebuilds the cloud profiles and switches to the first
+  new one. The route needs a platform bearer when the gate is on. `GET /models`
+  now includes `cloud.base`, `cloud.models`, `cloud.has_key` and
+  `local_reachable`, never the key, and marks a local profile unreachable when
+  a short `GET {base}/models` probe fails, so a turned-off host is a 409 rather
+  than a hung chat. `SIBYL_CLOUD_API_KEY` is no longer required to start: with
+  neither a key nor a local server the cloud profiles are listed unavailable
+  and a run tells you to pick a model in Settings.
+
 ### Changed
 
 - 2026-08-26: **one switchable profile per model, on a cloud server and a local

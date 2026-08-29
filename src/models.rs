@@ -1,18 +1,22 @@
-//! One profile per model on the cloud server and the local one, built from env at
-//! startup, with the active one persisted in sqlite so a restart keeps the
-//! operator's choice.
+//! Named providers, each with its own base URL, optional key and model list.
+//! Env seeds one `cloud` and one `local` provider. Settings can add more of
+//! either kind; the full list is stored in sqlite and overrides env on restart.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use axum::Json;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::auth;
+use crate::db::Db;
 use crate::llm::Client;
 use crate::sessions::ApiError;
 
@@ -31,11 +35,16 @@ const ID_SEPARATOR: char = ':';
 const CLOUD_NAME: &str = "cloud";
 const LOCAL_NAME: &str = "local";
 
-/// config key holding the active profile id
 pub const ACTIVE_KEY: &str = "active_model";
+pub const CLOUD_KEY_KEY: &str = "cloud_api_key";
+pub const CLOUD_BASE_KEY: &str = "cloud_api_base";
+pub const CLOUD_MODELS_KEY: &str = "cloud_models";
+pub const PROVIDERS_KEY: &str = "providers";
 
-/// which of the two servers a profile calls
-#[derive(Debug, Clone, Copy, PartialEq)]
+const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Server {
     Cloud,
     Local,
@@ -49,19 +58,23 @@ impl Server {
         }
     }
 
-    /// the cloud endpoint rejects an unauthenticated call, llama-server takes one
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            CLOUD_NAME => Some(Self::Cloud),
+            LOCAL_NAME => Some(Self::Local),
+            _ => None,
+        }
+    }
+
     fn needs_key(self) -> bool {
         matches!(self, Self::Cloud)
     }
 
-    /// `chat_template_kwargs` is a llama-server extension the cloud api would
-    /// reject or ignore
     fn takes_thinking(self) -> bool {
         matches!(self, Self::Local)
     }
 }
 
-/// the env the profiles are built from, blank values already read as unset
 pub struct Config {
     pub cloud_key: Option<String>,
     pub cloud_base: String,
@@ -82,9 +95,41 @@ impl Default for Config {
     }
 }
 
-/// what one profile connects to
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    pub label: String,
+    pub server: Server,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub models: Vec<String>,
+}
+
+impl Provider {
+    fn available(&self) -> bool {
+        self.key.is_some() || !self.server.needs_key()
+    }
+
+    fn to_specs(&self) -> Vec<Spec> {
+        self.models
+            .iter()
+            .map(|model| Spec {
+                provider: self.id.clone(),
+                label: self.label.clone(),
+                server: self.server,
+                base: self.base.clone(),
+                model: model.clone(),
+                key: self.key.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spec {
+    pub provider: String,
+    pub label: String,
     pub server: Server,
     pub base: String,
     pub model: String,
@@ -97,7 +142,6 @@ impl Spec {
     }
 }
 
-/// comma separated model ids, blanks dropped so a stray comma is harmless
 fn parse_models(raw: &str) -> Vec<String> {
     raw.split(MODEL_SEPARATOR)
         .map(str::trim)
@@ -106,9 +150,7 @@ fn parse_models(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// one spec per model, local ones first. fails when nothing is reachable, which
-/// keeps a forgotten key loud.
-pub fn specs(config: Config) -> Result<Vec<Spec>> {
+pub fn providers_from_config(config: Config) -> Result<Vec<Provider>> {
     let local_base = config
         .local_base
         .map(|base| base.trim_end_matches('/').to_string());
@@ -123,42 +165,116 @@ pub fn specs(config: Config) -> Result<Vec<Spec>> {
         _ => {}
     }
 
-    let mut specs = Vec::new();
+    let mut providers = Vec::new();
     if let Some(base) = local_base {
-        specs.extend(local_models.into_iter().map(|model| Spec {
+        providers.push(Provider {
+            id: LOCAL_NAME.into(),
+            label: LOCAL_NAME.into(),
             server: Server::Local,
-            base: base.clone(),
-            model,
-            // never forward the cloud key to a local server. an authenticated
-            // alternate provider would need its own key config, not this one
+            base,
             key: None,
-        }));
+            models: local_models,
+        });
     }
-    let cloud_base = config.cloud_base.trim_end_matches('/').to_string();
-    specs.extend(
-        parse_models(&config.cloud_models)
-            .into_iter()
-            .map(|model| Spec {
-                server: Server::Cloud,
-                base: cloud_base.clone(),
-                model,
-                key: config.cloud_key.clone(),
-            }),
-    );
-
-    if !specs.iter().any(Spec::available) {
-        bail!("no model is reachable, set {CLOUD_KEY_ENV} or {LOCAL_BASE_ENV}");
+    let cloud_models = parse_models(&config.cloud_models);
+    if !cloud_models.is_empty() {
+        providers.push(Provider {
+            id: CLOUD_NAME.into(),
+            label: CLOUD_NAME.into(),
+            server: Server::Cloud,
+            base: config.cloud_base.trim_end_matches('/').to_string(),
+            key: config.cloud_key,
+            models: cloud_models,
+        });
     }
-    Ok(specs)
+    if providers.is_empty() {
+        bail!("no model is configured, set {CLOUD_KEY_ENV} or {LOCAL_BASE_ENV}");
+    }
+    Ok(providers)
 }
 
-/// deliberately not `Serialize`: the client holds the api key, and the only way
-/// out to the wire is `ProfileView`, which has no field for it
+pub fn specs(config: Config) -> Result<Vec<Spec>> {
+    Ok(providers_from_config(config)?
+        .iter()
+        .flat_map(Provider::to_specs)
+        .collect())
+}
+
+fn present_stored(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn overlay_legacy_cloud(config: &mut Config, db: &Db) -> Result<()> {
+    if let Some(base) = present_stored(db.get_config(CLOUD_BASE_KEY)?) {
+        config.cloud_base = base;
+    }
+    if let Some(models) = present_stored(db.get_config(CLOUD_MODELS_KEY)?) {
+        config.cloud_models = models;
+    }
+    if let Some(key) = present_stored(db.get_config(CLOUD_KEY_KEY)?) {
+        config.cloud_key = Some(key);
+    }
+    Ok(())
+}
+
+/// sqlite providers list wins; otherwise env plus the old single-cloud rows
+pub fn load_providers(config: Config, db: &Db) -> Result<Vec<Provider>> {
+    if let Some(raw) = present_stored(db.get_config(PROVIDERS_KEY)?)
+        && let Ok(stored) = serde_json::from_str::<Vec<Provider>>(&raw)
+        && !stored.is_empty()
+    {
+        return Ok(stored);
+    }
+    let mut config = config;
+    overlay_legacy_cloud(&mut config, db)?;
+    providers_from_config(config)
+}
+
+fn valid_base(base: &str) -> bool {
+    (base.starts_with("http://") || base.starts_with("https://"))
+        && !base.contains(char::is_whitespace)
+}
+
+fn slug(raw: &str, server: Server) -> String {
+    let mut out = String::new();
+    for ch in raw.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == ' ' || ch == '-' || ch == '_' {
+            if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        server.name().to_string()
+    } else {
+        out
+    }
+}
+
+fn unique_id(preferred: &str, existing: &[Provider]) -> String {
+    if !existing.iter().any(|provider| provider.id == preferred) {
+        return preferred.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("{preferred}-{n}");
+        if !existing.iter().any(|provider| provider.id == candidate) {
+            return candidate;
+        }
+    }
+    format!("{preferred}-new")
+}
+
 pub struct Profile {
     id: String,
     label: String,
     model: String,
     server: Server,
+    provider: String,
     client: Option<Arc<Client>>,
 }
 
@@ -166,13 +282,15 @@ impl Profile {
     fn new(spec: Spec, http: &reqwest::Client, max_tokens: Option<u32>, thinking: bool) -> Self {
         let available = spec.available();
         let Spec {
+            provider,
+            label,
             server,
             base,
             model,
             key,
         } = spec;
-        let id = format!("{}{ID_SEPARATOR}{model}", server.name());
-        let label = format!("{model} ({})", server.name());
+        let id = format!("{provider}{ID_SEPARATOR}{model}");
+        let display = format!("{model} ({label})");
         let client = available.then(|| {
             Arc::new(Client::new(
                 http.clone(),
@@ -185,9 +303,10 @@ impl Profile {
         });
         Self {
             id,
-            label,
+            label: display,
             model,
             server,
+            provider,
             client,
         }
     }
@@ -198,12 +317,14 @@ impl Profile {
 }
 
 #[derive(Serialize)]
-struct ProfileView<'a> {
-    id: &'a str,
-    label: &'a str,
-    model: &'a str,
-    server: &'a str,
+struct ProfileView {
+    id: String,
+    label: String,
+    model: String,
+    server: String,
+    provider: String,
     available: bool,
+    reachable: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,31 +333,36 @@ pub enum SwitchError {
     Unavailable,
 }
 
-pub struct Models {
+#[derive(Debug, PartialEq)]
+pub enum CloudError {
+    Invalid(&'static str),
+    Unreachable,
+    UnknownProvider,
+}
+
+struct Inner {
+    providers: Vec<Provider>,
     profiles: Vec<Profile>,
-    active: Mutex<String>,
+    active: String,
+}
+
+pub struct Models {
+    http: reqwest::Client,
+    max_tokens: Option<u32>,
+    thinking: bool,
+    inner: Mutex<Inner>,
 }
 
 impl Models {
-    /// `stored` is the persisted choice, ignored when it names a profile that is
-    /// no longer available or no longer configured, so a pulled key cannot leave
-    /// sibyl pointing at nothing
     pub fn new(
         http: &reqwest::Client,
-        specs: Vec<Spec>,
+        providers: Vec<Provider>,
         stored: Option<String>,
         max_tokens: Option<u32>,
         thinking: bool,
     ) -> Self {
-        let profiles: Vec<Profile> = specs
-            .into_iter()
-            .map(|spec| Profile::new(spec, http, max_tokens, thinking))
-            .collect();
-        let fallback = profiles
-            .iter()
-            .find(|profile| profile.available())
-            .map(|profile| profile.id.clone())
-            .unwrap_or_default();
+        let profiles = profiles_from(http, &providers, max_tokens, thinking);
+        let fallback = fallback_id(&profiles);
         let active = stored
             .filter(|id| {
                 profiles
@@ -245,65 +371,374 @@ impl Models {
             })
             .unwrap_or(fallback);
         Self {
-            profiles,
-            active: Mutex::new(active),
+            http: http.clone(),
+            max_tokens,
+            thinking,
+            inner: Mutex::new(Inner {
+                providers,
+                profiles,
+                active,
+            }),
+        }
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().expect("models mutex")
+    }
+
+    fn rebuild_locked(inner: &mut Inner, http: &reqwest::Client, max_tokens: Option<u32>, thinking: bool) {
+        inner.profiles = profiles_from(http, &inner.providers, max_tokens, thinking);
+        if !inner
+            .profiles
+            .iter()
+            .any(|profile| profile.id == inner.active && profile.available())
+        {
+            inner.active = fallback_id(&inner.profiles);
         }
     }
 
     pub fn active(&self) -> String {
-        self.active.lock().expect("active model mutex").clone()
+        self.inner().active.clone()
     }
 
-    fn profile(&self, id: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|profile| profile.id == id)
-    }
-
-    /// the client a run should use. every reachable active id has one, so an
-    /// unavailable profile can never become active.
-    pub fn active_client(&self) -> Arc<Client> {
-        self.profile(&self.active())
+    pub fn active_client(&self) -> Option<Arc<Client>> {
+        let inner = self.inner();
+        inner
+            .profiles
+            .iter()
+            .find(|profile| profile.id == inner.active)
             .and_then(|profile| profile.client.clone())
-            .expect("the active profile is always available")
     }
 
     pub fn active_label(&self) -> String {
-        self.profile(&self.active())
+        let inner = self.inner();
+        inner
+            .profiles
+            .iter()
+            .find(|profile| profile.id == inner.active)
             .map_or_else(String::new, |profile| profile.label.clone())
     }
 
-    /// checks an id the operator asked for without switching to it yet
-    pub fn resolve(&self, id: &str) -> Result<&str, SwitchError> {
-        let profile = self.profile(id).ok_or(SwitchError::Unknown)?;
+    pub fn resolve(&self, id: &str) -> Result<String, SwitchError> {
+        let inner = self.inner();
+        let profile = inner
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or(SwitchError::Unknown)?;
         if profile.available() {
-            Ok(&profile.id)
+            Ok(profile.id.clone())
         } else {
             Err(SwitchError::Unavailable)
         }
     }
 
-    /// takes effect on the next run, a run already going keeps its own client
+    fn profile_meta(&self, id: &str) -> Option<(Server, String, String)> {
+        let inner = self.inner();
+        inner.profiles.iter().find(|profile| profile.id == id).map(|profile| {
+            (profile.server, profile.provider.clone(), profile.id.clone())
+        })
+    }
+
     pub fn activate(&self, id: &str) {
-        *self.active.lock().expect("active model mutex") = id.to_string();
+        self.inner().active = id.to_string();
+    }
+
+    fn first_available_cloud_id(&self) -> Option<String> {
+        self.inner()
+            .profiles
+            .iter()
+            .find(|profile| profile.server == Server::Cloud && profile.available())
+            .map(|profile| profile.id.clone())
+    }
+
+    /// unreachable local falls back to the first reachable cloud profile
+    pub async fn client_for_run(&self) -> Result<Arc<Client>, String> {
+        let Some(client) = self.active_client() else {
+            return Err("No model is configured. Add one in Settings.".into());
+        };
+        let Some((Server::Local, provider, _)) = self.profile_meta(&self.active()) else {
+            return Ok(client);
+        };
+        let reach = self.probe_locals().await;
+        if reach.get(&provider) != Some(&false) {
+            return Ok(client);
+        }
+        let Some(cloud_id) = self.first_available_cloud_id() else {
+            return Err(
+                "The local model isn't running. Start it, or add a cloud API in Settings.".into(),
+            );
+        };
+        self.activate(&cloud_id);
+        self.active_client().ok_or_else(|| {
+            "The local model isn't running. Start it, or add a cloud API in Settings.".into()
+        })
     }
 
     pub fn view(&self) -> Value {
-        let profiles: Vec<ProfileView<'_>> = self
+        self.view_with_reachability(&HashMap::new())
+    }
+
+    pub fn view_with_reachability(&self, local_reach: &HashMap<String, bool>) -> Value {
+        let inner = self.inner();
+        let profiles: Vec<ProfileView> = inner
             .profiles
             .iter()
-            .map(|profile| ProfileView {
-                id: &profile.id,
-                label: &profile.label,
-                model: &profile.model,
-                server: profile.server.name(),
-                available: profile.available(),
+            .map(|profile| {
+                let reachable = match profile.server {
+                    Server::Local => *local_reach.get(&profile.provider).unwrap_or(&true),
+                    Server::Cloud => profile.available(),
+                };
+                ProfileView {
+                    id: profile.id.clone(),
+                    label: profile.label.clone(),
+                    model: profile.model.clone(),
+                    server: profile.server.name().to_string(),
+                    provider: profile.provider.clone(),
+                    available: profile.available(),
+                    reachable,
+                }
             })
             .collect();
-        json!({ "active": self.active(), "profiles": profiles })
+        let providers: Vec<Value> = inner
+            .providers
+            .iter()
+            .map(|provider| {
+                let reachable = match provider.server {
+                    Server::Local => *local_reach.get(&provider.id).unwrap_or(&true),
+                    Server::Cloud => provider.available(),
+                };
+                json!({
+                    "id": provider.id,
+                    "label": provider.label,
+                    "server": provider.server.name(),
+                    "base": provider.base,
+                    "models": provider.models,
+                    "has_key": provider.key.is_some(),
+                    "reachable": reachable,
+                })
+            })
+            .collect();
+        let cloud = inner
+            .providers
+            .iter()
+            .find(|provider| provider.server == Server::Cloud);
+        json!({
+            "active": inner.active,
+            "profiles": profiles,
+            "providers": providers,
+            "cloud": cloud.map(|provider| json!({
+                "id": provider.id,
+                "base": provider.base,
+                "models": provider.models.join(","),
+                "has_key": provider.key.is_some(),
+            })),
+        })
+    }
+
+    pub fn stored_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.inner().providers)?)
+    }
+
+    pub async fn probe_locals(&self) -> HashMap<String, bool> {
+        let locals: Vec<(String, String)> = self
+            .inner()
+            .providers
+            .iter()
+            .filter(|provider| provider.server == Server::Local)
+            .map(|provider| (provider.id.clone(), provider.base.clone()))
+            .collect();
+        let mut out = HashMap::new();
+        for (id, base) in locals {
+            out.insert(id, probe_base(&base).await);
+        }
+        out
+    }
+
+    pub fn upsert_provider(&self, update: ProviderUpdate) -> Result<Upserted, CloudError> {
+        let mut inner = self.inner();
+        let existing = update
+            .id
+            .as_deref()
+            .and_then(|id| inner.providers.iter().find(|provider| provider.id == id))
+            .cloned();
+
+        let server = match update.server.or(existing.as_ref().map(|provider| provider.server)) {
+            Some(server) => server,
+            None => return Err(CloudError::Invalid("server must be cloud or local")),
+        };
+        let base = match update.base {
+            Some(base) => {
+                let base = base.trim().trim_end_matches('/').to_string();
+                if !valid_base(&base) {
+                    return Err(CloudError::Invalid("base must be an http or https URL"));
+                }
+                base
+            }
+            None => existing
+                .as_ref()
+                .map(|provider| provider.base.clone())
+                .ok_or(CloudError::Invalid("base must be an http or https URL"))?,
+        };
+        let models = match update.models {
+            Some(models) => {
+                let parsed = parse_models(&models);
+                if parsed.is_empty() {
+                    return Err(CloudError::Invalid("models must name at least one model"));
+                }
+                parsed
+            }
+            None => existing
+                .as_ref()
+                .map(|provider| provider.models.clone())
+                .filter(|models| !models.is_empty())
+                .ok_or(CloudError::Invalid("models must name at least one model"))?,
+        };
+        let provided_key = match update.key {
+            Some(key) => {
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    return Err(CloudError::Invalid("key must not be empty"));
+                }
+                Some(key)
+            }
+            None => None,
+        };
+        let key = if server.needs_key() {
+            provided_key
+                .clone()
+                .or_else(|| existing.as_ref().and_then(|provider| provider.key.clone()))
+        } else {
+            None
+        };
+        let label = update
+            .label
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .or_else(|| existing.as_ref().map(|provider| provider.label.clone()))
+            .unwrap_or_else(|| server.name().to_string());
+        let id = match update.id.filter(|id| !id.trim().is_empty()) {
+            Some(id) => id.trim().to_string(),
+            None if existing.is_some() => existing.as_ref().unwrap().id.clone(),
+            None => unique_id(&slug(&label, server), &inner.providers),
+        };
+
+        let provider = Provider {
+            id: id.clone(),
+            label,
+            server,
+            base,
+            key,
+            models,
+        };
+        if let Some(index) = inner.providers.iter().position(|item| item.id == id) {
+            inner.providers[index] = provider;
+        } else {
+            inner.providers.push(provider);
+        }
+
+        let first_new = format!(
+            "{id}{ID_SEPARATOR}{}",
+            inner
+                .providers
+                .iter()
+                .find(|item| item.id == id)
+                .and_then(|item| item.models.first())
+                .cloned()
+                .unwrap_or_default()
+        );
+        Self::rebuild_locked(&mut inner, &self.http, self.max_tokens, self.thinking);
+        if inner
+            .profiles
+            .iter()
+            .any(|profile| profile.id == first_new && profile.available())
+        {
+            inner.active = first_new;
+        }
+        Ok(Upserted {
+            id,
+            active: inner.active.clone(),
+            key: provided_key,
+        })
+    }
+
+    pub fn remove_provider(&self, id: &str) -> Result<(), CloudError> {
+        let mut inner = self.inner();
+        let before = inner.providers.len();
+        inner.providers.retain(|provider| provider.id != id);
+        if inner.providers.len() == before {
+            return Err(CloudError::UnknownProvider);
+        }
+        Self::rebuild_locked(&mut inner, &self.http, self.max_tokens, self.thinking);
+        Ok(())
+    }
+
+    pub fn configure_cloud(&self, update: CloudUpdate) -> Result<CloudApplied, CloudError> {
+        let provided = update.key.clone();
+        self.upsert_provider(ProviderUpdate {
+            id: Some(CLOUD_NAME.into()),
+            label: Some(CLOUD_NAME.into()),
+            server: Some(Server::Cloud),
+            base: update.base,
+            key: update.key,
+            models: update.models,
+        })?;
+        let inner = self.inner();
+        let cloud = inner
+            .providers
+            .iter()
+            .find(|provider| provider.id == CLOUD_NAME)
+            .ok_or(CloudError::Unreachable)?;
+        Ok(CloudApplied {
+            base: cloud.base.clone(),
+            models: cloud.models.join(","),
+            key: provided
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty()),
+            active: inner.active.clone(),
+        })
     }
 }
 
+fn profiles_from(
+    http: &reqwest::Client,
+    providers: &[Provider],
+    max_tokens: Option<u32>,
+    thinking: bool,
+) -> Vec<Profile> {
+    providers
+        .iter()
+        .flat_map(Provider::to_specs)
+        .map(|spec| Profile::new(spec, http, max_tokens, thinking))
+        .collect()
+}
+
+fn fallback_id(profiles: &[Profile]) -> String {
+    profiles
+        .iter()
+        .find(|profile| profile.available())
+        .map(|profile| profile.id.clone())
+        .unwrap_or_default()
+}
+
+async fn probe_base(base: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(LOCAL_PROBE_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{base}/models"))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
 pub async fn list(State(state): State<AppState>) -> Json<Value> {
-    Json(state.models.view())
+    let reach = state.models.probe_locals().await;
+    Json(state.models.view_with_reachability(&reach))
 }
 
 #[derive(Deserialize)]
@@ -317,10 +752,171 @@ pub async fn switch(State(state): State<AppState>, Json(payload): Json<SwitchPay
         Err(SwitchError::Unknown) => return StatusCode::NOT_FOUND.into_response(),
         Err(SwitchError::Unavailable) => return StatusCode::CONFLICT.into_response(),
     };
-    if let Err(err) = state.db.set_config(ACTIVE_KEY, id) {
+    if let Some((Server::Local, provider, _)) = state.models.profile_meta(&id) {
+        let reach = state.models.probe_locals().await;
+        if reach.get(&provider) == Some(&false) {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
+    if let Err(err) = state.db.set_config(ACTIVE_KEY, &id) {
         return ApiError::from(err).into_response();
     }
-    state.models.activate(id);
+    state.models.activate(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CloudPayload {
+    pub base: Option<String>,
+    pub key: Option<String>,
+    pub models: Option<String>,
+}
+
+pub struct CloudUpdate {
+    pub base: Option<String>,
+    pub key: Option<String>,
+    pub models: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CloudApplied {
+    pub base: String,
+    pub models: String,
+    pub key: Option<String>,
+    pub active: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProviderPayload {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub server: Option<String>,
+    pub base: Option<String>,
+    pub key: Option<String>,
+    pub models: Option<String>,
+}
+
+pub struct ProviderUpdate {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub server: Option<Server>,
+    pub base: Option<String>,
+    pub key: Option<String>,
+    pub models: Option<String>,
+}
+
+pub struct Upserted {
+    pub id: String,
+    pub active: String,
+    pub key: Option<String>,
+}
+
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    state
+        .auth
+        .subject(auth::bearer(headers))
+        .map(|_| ())
+        .map_err(|err| err.into_response())
+}
+
+fn persist_state(state: &AppState) -> Result<(), Response> {
+    let json = match state.models.stored_json() {
+        Ok(json) => json,
+        Err(err) => return Err(ApiError::from(err).into_response()),
+    };
+    if let Err(err) = state.db.set_config(PROVIDERS_KEY, &json) {
+        return Err(ApiError::from(err).into_response());
+    }
+    if let Err(err) = state.db.set_config(ACTIVE_KEY, &state.models.active()) {
+        return Err(ApiError::from(err).into_response());
+    }
+    Ok(())
+}
+
+fn cloud_err(err: CloudError) -> Response {
+    match err {
+        CloudError::Invalid(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": reason })),
+        )
+            .into_response(),
+        CloudError::Unreachable => StatusCode::CONFLICT.into_response(),
+        CloudError::UnknownProvider => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub async fn configure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CloudPayload>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    if let Err(err) = state.models.configure_cloud(CloudUpdate {
+        base: payload.base,
+        key: payload.key,
+        models: payload.models,
+    }) {
+        return cloud_err(err);
+    }
+    if let Err(response) = persist_state(&state) {
+        return response;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn upsert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ProviderPayload>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let server = match payload.server.as_deref() {
+        None => None,
+        Some(raw) => match Server::parse(raw) {
+            Some(server) => Some(server),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "server must be cloud or local" })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    if let Err(err) = state.models.upsert_provider(ProviderUpdate {
+        id: payload.id,
+        label: payload.label,
+        server,
+        base: payload.base,
+        key: payload.key,
+        models: payload.models,
+    }) {
+        return cloud_err(err);
+    }
+    if let Err(response) = persist_state(&state) {
+        return response;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    if let Err(err) = state.models.remove_provider(&id) {
+        return cloud_err(err);
+    }
+    if let Err(response) = persist_state(&state) {
+        return response;
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -334,8 +930,8 @@ mod tests {
     const CLOUD_ID: &str = "cloud:grok-4-1-fast-reasoning";
     const LOCAL_ID: &str = "local:Qwen3.5-9B-Q4_K_M";
 
-    fn both() -> Vec<Spec> {
-        specs(Config {
+    fn both() -> Vec<Provider> {
+        providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             local_base: Some(LOCAL_BASE.into()),
             local_models: Some(LOCAL_MODEL.into()),
@@ -344,27 +940,28 @@ mod tests {
         .unwrap()
     }
 
-    fn local_only() -> Vec<Spec> {
-        specs(Config {
+    fn local_only() -> Vec<Provider> {
+        providers_from_config(Config {
             local_base: Some(LOCAL_BASE.into()),
             local_models: Some(LOCAL_MODEL.into()),
+            cloud_models: String::new(),
             ..Config::default()
         })
         .unwrap()
     }
 
-    fn cloud_only() -> Vec<Spec> {
-        specs(Config {
+    fn cloud_only() -> Vec<Provider> {
+        providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             ..Config::default()
         })
         .unwrap()
     }
 
-    fn models(specs: Vec<Spec>, stored: Option<&str>) -> Models {
+    fn models(providers: Vec<Provider>, stored: Option<&str>) -> Models {
         Models::new(
             &reqwest::Client::new(),
-            specs,
+            providers,
             stored.map(str::to_string),
             None,
             false,
@@ -375,40 +972,26 @@ mod tests {
     fn a_model_list_drops_spaces_and_empty_entries() {
         assert_eq!(
             parse_models(" grok-4 , qwen3 ,, ,glm-5 "),
-            vec![
-                "grok-4".to_string(),
-                "qwen3".to_string(),
-                "glm-5".to_string()
-            ]
+            vec!["grok-4".to_string(), "qwen3".to_string(), "glm-5".to_string()]
         );
-        assert_eq!(parse_models("solo"), vec!["solo".to_string()]);
         assert!(parse_models(" , ").is_empty());
-        assert!(parse_models("").is_empty());
     }
 
     #[test]
-    fn one_cloud_spec_per_listed_model() {
-        let specs = specs(Config {
+    fn one_cloud_provider_carries_each_listed_model() {
+        let providers = providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             cloud_models: "grok-4, grok-3".into(),
             ..Config::default()
         })
         .unwrap();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(
-            specs[0],
-            Spec {
-                server: Server::Cloud,
-                base: DEFAULT_CLOUD_API_BASE.into(),
-                model: "grok-4".into(),
-                key: Some(KEY.into()),
-            }
-        );
-        assert_eq!(specs[1].model, "grok-3");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].models, vec!["grok-4", "grok-3"]);
+        assert_eq!(providers[0].id, CLOUD_NAME);
     }
 
     #[test]
-    fn local_specs_come_first_and_carry_no_key() {
+    fn local_models_on_one_server_come_first_and_carry_no_key() {
         let specs = specs(Config {
             cloud_key: Some(KEY.into()),
             local_base: Some(LOCAL_BASE.into()),
@@ -421,15 +1004,14 @@ mod tests {
         assert_eq!(specs[1].server, Server::Local);
         assert_eq!(specs[2].server, Server::Cloud);
         for spec in specs.iter().take(2) {
-            assert_eq!(spec.base, LOCAL_BASE);
-            assert_eq!(spec.key, None, "the cloud key reached the local server");
+            assert_eq!(spec.key, None);
+            assert_eq!(spec.provider, LOCAL_NAME);
         }
-        assert_eq!(specs[2].key.as_deref(), Some(KEY));
     }
 
     #[test]
     fn both_base_urls_lose_a_trailing_slash() {
-        let specs = specs(Config {
+        let providers = providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             cloud_base: "https://api.example.com/v1/".into(),
             local_base: Some(format!("{LOCAL_BASE}/")),
@@ -437,13 +1019,13 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        assert_eq!(specs[0].base, LOCAL_BASE);
-        assert_eq!(specs[1].base, "https://api.example.com/v1");
+        assert_eq!(providers[0].base, LOCAL_BASE);
+        assert_eq!(providers[1].base, "https://api.example.com/v1");
     }
 
     #[test]
     fn a_local_base_without_models_is_refused() {
-        let err = specs(Config {
+        let err = providers_from_config(Config {
             local_base: Some(LOCAL_BASE.into()),
             local_models: Some(" , ".into()),
             ..Config::default()
@@ -451,12 +1033,11 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(LOCAL_BASE_ENV), "{err}");
-        assert!(err.contains(LOCAL_MODELS_ENV), "{err}");
     }
 
     #[test]
     fn local_models_without_a_base_are_refused() {
-        let err = specs(Config {
+        let err = providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             local_models: Some(LOCAL_MODEL.into()),
             ..Config::default()
@@ -464,45 +1045,105 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(LOCAL_BASE_ENV), "{err}");
-        assert!(err.contains(LOCAL_MODELS_ENV), "{err}");
     }
 
     #[test]
-    fn no_key_and_no_local_base_fails_fast() {
-        let err = specs(Config::default()).unwrap_err().to_string();
-        assert!(err.contains(CLOUD_KEY_ENV), "{err}");
-        assert!(err.contains(LOCAL_BASE_ENV), "{err}");
+    fn no_key_starts_with_cloud_unavailable() {
+        let models = models(providers_from_config(Config::default()).unwrap(), None);
+        let view = models.view();
+        assert_eq!(view["cloud"]["has_key"], false);
+        assert_eq!(view["profiles"][0]["available"], false);
+        assert!(models.active_client().is_none());
     }
 
     #[test]
-    fn cloud_profiles_are_listed_unavailable_without_the_key() {
-        let specs = specs(Config {
-            cloud_models: "grok-4, grok-3".into(),
-            local_base: Some(LOCAL_BASE.into()),
-            local_models: Some(LOCAL_MODEL.into()),
-            ..Config::default()
-        })
-        .unwrap();
-        let view = models(specs, None).view();
+    fn a_pasted_key_makes_the_default_cloud_profile_live() {
+        let models = models(providers_from_config(Config::default()).unwrap(), None);
+        models
+            .configure_cloud(CloudUpdate {
+                base: None,
+                key: Some("sk-live".into()),
+                models: None,
+            })
+            .unwrap();
+        assert_eq!(models.active(), CLOUD_ID);
+        assert_eq!(models.view()["cloud"]["has_key"], true);
+    }
+
+    #[test]
+    fn adding_a_second_cloud_keeps_the_first() {
+        let models = models(cloud_only(), None);
+        models
+            .upsert_provider(ProviderUpdate {
+                id: Some("anthropic".into()),
+                label: Some("Anthropic".into()),
+                server: Some(Server::Cloud),
+                base: Some("https://api.anthropic.com/v1".into()),
+                key: Some("sk-ant".into()),
+                models: Some("claude-sonnet-4-5".into()),
+            })
+            .unwrap();
+        let view = models.view();
+        let ids: Vec<&str> = view["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["cloud", "anthropic"]);
+        let profile_ids: Vec<&str> = view["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|profile| profile["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            profile_ids,
+            vec![CLOUD_ID, "anthropic:claude-sonnet-4-5"]
+        );
+        assert_eq!(models.active(), "anthropic:claude-sonnet-4-5");
+        let body = serde_json::to_string(&view).unwrap();
+        assert!(!body.contains("sk-ant"), "{body}");
+        assert!(!body.contains(KEY), "{body}");
+    }
+
+    #[test]
+    fn adding_a_second_local_server_keeps_the_first() {
+        let models = models(local_only(), None);
+        models
+            .upsert_provider(ProviderUpdate {
+                id: None,
+                label: Some("Workshop".into()),
+                server: Some(Server::Local),
+                base: Some("http://127.0.0.1:18100/v1".into()),
+                key: None,
+                models: Some("gpt-oss-20b, qwen3".into()),
+            })
+            .unwrap();
+        let view = models.view();
+        assert_eq!(view["providers"].as_array().unwrap().len(), 2);
         assert_eq!(view["profiles"].as_array().unwrap().len(), 3);
-        assert_eq!(view["profiles"][1]["id"], "cloud:grok-4");
-        assert_eq!(view["profiles"][1]["available"], false);
-        assert_eq!(view["profiles"][2]["available"], false);
+        assert_eq!(view["profiles"][1]["id"], "workshop:gpt-oss-20b");
+        assert_eq!(view["profiles"][2]["provider"], "workshop");
     }
 
     #[test]
-    fn an_id_names_its_server_and_a_label_names_both() {
+    fn removing_a_provider_drops_its_profiles() {
+        let models = models(both(), None);
+        models.remove_provider(CLOUD_NAME).unwrap();
+        let view = models.view();
+        assert_eq!(view["providers"].as_array().unwrap().len(), 1);
+        assert_eq!(view["profiles"][0]["id"], LOCAL_ID);
+        assert_eq!(models.active(), LOCAL_ID);
+    }
+
+    #[test]
+    fn an_id_names_its_provider() {
         let view = models(both(), None).view();
         assert_eq!(view["profiles"][0]["id"], LOCAL_ID);
         assert_eq!(view["profiles"][0]["label"], "Qwen3.5-9B-Q4_K_M (local)");
-        assert_eq!(view["profiles"][0]["model"], LOCAL_MODEL);
-        assert_eq!(view["profiles"][0]["server"], LOCAL_NAME);
+        assert_eq!(view["profiles"][0]["provider"], LOCAL_NAME);
         assert_eq!(view["profiles"][1]["id"], CLOUD_ID);
-        assert_eq!(
-            view["profiles"][1]["label"],
-            "grok-4-1-fast-reasoning (cloud)"
-        );
-        assert_eq!(view["profiles"][1]["server"], CLOUD_NAME);
     }
 
     #[test]
@@ -511,57 +1152,142 @@ mod tests {
     }
 
     #[test]
-    fn cloud_is_the_default_when_there_is_no_local() {
-        assert_eq!(models(cloud_only(), None).active(), CLOUD_ID);
-    }
-
-    #[test]
     fn a_stored_choice_is_honoured() {
         assert_eq!(models(both(), Some(CLOUD_ID)).active(), CLOUD_ID);
     }
 
-    /// the key was pulled, so the stored cloud choice cannot be honoured
     #[test]
     fn an_unavailable_stored_choice_falls_back() {
         assert_eq!(models(local_only(), Some(CLOUD_ID)).active(), LOCAL_ID);
     }
 
-    /// the ids before profiles were per model, stored in sqlite by an older build
-    #[test]
-    fn a_stored_legacy_id_falls_back() {
-        for legacy in [CLOUD_NAME, LOCAL_NAME, "nonsense"] {
-            assert_eq!(models(both(), Some(legacy)).active(), LOCAL_ID, "{legacy}");
-        }
+    #[tokio::test]
+    async fn a_run_falls_back_to_cloud_when_local_is_down() {
+        let providers = providers_from_config(Config {
+            cloud_key: Some(KEY.into()),
+            local_base: Some("http://127.0.0.1:1/v1".into()),
+            local_models: Some(LOCAL_MODEL.into()),
+            ..Config::default()
+        })
+        .unwrap();
+        let models = models(providers, Some(LOCAL_ID));
+        assert_eq!(models.active(), LOCAL_ID);
+        let client = models.client_for_run().await.unwrap();
+        assert_eq!(client.model(), DEFAULT_CLOUD_MODELS);
+        assert_eq!(models.active(), CLOUD_ID);
     }
 
     #[test]
     fn switching_changes_the_client_a_run_would_use() {
         let models = models(both(), None);
-        assert_eq!(models.active_client().model(), LOCAL_MODEL);
-
-        models.activate(models.resolve(CLOUD_ID).unwrap());
-        assert_eq!(models.active(), CLOUD_ID);
-        assert_eq!(models.active_client().model(), DEFAULT_CLOUD_MODELS);
+        assert_eq!(models.active_client().unwrap().model(), LOCAL_MODEL);
+        models.activate(&models.resolve(CLOUD_ID).unwrap());
+        assert_eq!(models.active_client().unwrap().model(), DEFAULT_CLOUD_MODELS);
     }
 
-    #[test]
-    fn resolve_separates_unknown_from_unavailable() {
-        let models = models(local_only(), None);
-        assert_eq!(models.resolve("gpt5"), Err(SwitchError::Unknown));
-        assert_eq!(models.resolve(LOCAL_NAME), Err(SwitchError::Unknown));
-        assert_eq!(models.resolve(CLOUD_ID), Err(SwitchError::Unavailable));
-        assert_eq!(models.resolve(LOCAL_ID), Ok(LOCAL_ID));
-    }
-
-    /// the whole point of ProfileView: no key, and no base url either
     #[test]
     fn the_view_never_carries_the_key() {
-        let body = serde_json::to_string(&models(both(), None).view()).unwrap();
-        assert!(!body.contains(KEY), "key leaked into /models: {body}");
-        assert!(!body.to_lowercase().contains("authorization"));
-        assert!(!body.contains("xai-"));
-        assert!(!body.contains(LOCAL_BASE));
-        assert!(!body.contains(DEFAULT_CLOUD_API_BASE));
+        let view = models(both(), None).view();
+        let body = serde_json::to_string(&view).unwrap();
+        assert!(!body.contains(KEY), "{body}");
+        assert_eq!(view["providers"][1]["has_key"], true);
+        assert!(view["providers"][1].get("key").is_none());
+        assert_eq!(view["providers"][1]["base"], DEFAULT_CLOUD_API_BASE);
+    }
+
+    #[test]
+    fn load_providers_prefers_the_stored_list() {
+        let temp = crate::db::testing::TempDb::new();
+        let stored = vec![Provider {
+            id: "anthropic".into(),
+            label: "Anthropic".into(),
+            server: Server::Cloud,
+            base: "https://api.anthropic.com/v1".into(),
+            key: Some("sk-ant".into()),
+            models: vec!["claude-sonnet-4-5".into()],
+        }];
+        temp.db
+            .set_config(PROVIDERS_KEY, &serde_json::to_string(&stored).unwrap())
+            .unwrap();
+        let loaded = load_providers(
+            Config {
+                cloud_key: Some(KEY.into()),
+                ..Config::default()
+            },
+            &temp.db,
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "anthropic");
+        assert_eq!(loaded[0].key.as_deref(), Some("sk-ant"));
+    }
+
+    #[test]
+    fn load_providers_falls_back_to_legacy_cloud_rows() {
+        let temp = crate::db::testing::TempDb::new();
+        temp.db
+            .set_config(CLOUD_BASE_KEY, "https://api.anthropic.com/v1")
+            .unwrap();
+        temp.db
+            .set_config(CLOUD_MODELS_KEY, "claude-sonnet-4-5")
+            .unwrap();
+        temp.db.set_config(CLOUD_KEY_KEY, "sk-ant-test").unwrap();
+        let loaded = load_providers(
+            Config {
+                cloud_key: Some(KEY.into()),
+                ..Config::default()
+            },
+            &temp.db,
+        )
+        .unwrap();
+        assert_eq!(loaded[0].base, "https://api.anthropic.com/v1");
+        assert_eq!(loaded[0].models, vec!["claude-sonnet-4-5"]);
+        assert_eq!(loaded[0].key.as_deref(), Some("sk-ant-test"));
+    }
+
+    #[test]
+    fn configuring_cloud_keeps_local_and_other_clouds() {
+        let models = models(both(), None);
+        models
+            .upsert_provider(ProviderUpdate {
+                id: Some("anthropic".into()),
+                label: Some("Anthropic".into()),
+                server: Some(Server::Cloud),
+                base: Some("https://api.anthropic.com/v1".into()),
+                key: Some("sk-ant".into()),
+                models: Some("claude-sonnet-4-5".into()),
+            })
+            .unwrap();
+        models
+            .configure_cloud(CloudUpdate {
+                base: Some("https://api.x.ai/v1".into()),
+                key: Some("xai-new".into()),
+                models: Some("grok-4".into()),
+            })
+            .unwrap();
+        let ids: Vec<String> = models
+            .view()["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["local", "cloud", "anthropic"]);
+        assert_eq!(models.active(), "cloud:grok-4");
+    }
+
+    #[test]
+    fn a_blank_or_invalid_cloud_update_is_refused() {
+        let models = models(both(), None);
+        assert_eq!(
+            models.configure_cloud(CloudUpdate {
+                base: Some("ftp://example.com".into()),
+                key: None,
+                models: None,
+            }),
+            Err(CloudError::Invalid("base must be an http or https URL"))
+        );
+        assert_eq!(models.active(), LOCAL_ID);
     }
 
     mod endpoints {
@@ -571,10 +1297,10 @@ mod tests {
         use crate::tools::ToolCatalog;
         use std::time::Duration;
 
-        fn state(specs: Vec<Spec>, db: crate::db::Db) -> AppState {
+        fn state(providers: Vec<Provider>, db: crate::db::Db) -> AppState {
             AppState {
                 db: Arc::new(db),
-                models: Arc::new(models(specs, None)),
+                models: Arc::new(models(providers, None)),
                 catalog: Arc::new(ToolCatalog::new(
                     reqwest::Client::new(),
                     "http://127.0.0.1:1".into(),
@@ -599,39 +1325,107 @@ mod tests {
         async fn switching_returns_204_and_persists_the_choice() {
             let temp = TempDb::new();
             let state = state(both(), temp.reopen());
-            assert_eq!(state.models.active(), LOCAL_ID);
-
             assert_eq!(put(&state, CLOUD_ID).await, StatusCode::NO_CONTENT);
             assert_eq!(state.models.active(), CLOUD_ID);
-            assert_eq!(
-                temp.db.get_config(ACTIVE_KEY).unwrap().as_deref(),
-                Some(CLOUD_ID)
-            );
         }
 
         #[tokio::test]
-        async fn an_unknown_id_is_404_and_an_unavailable_one_is_409() {
+        async fn adding_a_provider_persists_the_list_without_the_key_in_the_listing() {
             let temp = TempDb::new();
-            let state = state(local_only(), temp.reopen());
-
-            assert_eq!(put(&state, "gpt5").await, StatusCode::NOT_FOUND);
-            assert_eq!(put(&state, LOCAL_NAME).await, StatusCode::NOT_FOUND);
-            assert_eq!(put(&state, CLOUD_ID).await, StatusCode::CONFLICT);
-            // neither attempt may move or persist anything
-            assert_eq!(state.models.active(), LOCAL_ID);
-            assert_eq!(temp.db.get_config(ACTIVE_KEY).unwrap(), None);
+            let state = state(cloud_only(), temp.reopen());
+            let response = upsert(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(ProviderPayload {
+                    id: Some("anthropic".into()),
+                    label: Some("Anthropic".into()),
+                    server: Some("cloud".into()),
+                    base: Some("https://api.anthropic.com/v1".into()),
+                    key: Some("sk-ant-saved".into()),
+                    models: Some("claude-sonnet-4-5".into()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let stored: Vec<Provider> =
+                serde_json::from_str(&temp.db.get_config(PROVIDERS_KEY).unwrap().unwrap()).unwrap();
+            assert_eq!(stored.len(), 2);
+            assert_eq!(stored[1].key.as_deref(), Some("sk-ant-saved"));
+            let Json(view) = list(State(state)).await;
+            let body = serde_json::to_string(&view).unwrap();
+            assert!(!body.contains("sk-ant-saved"), "{body}");
+            assert_eq!(view["providers"].as_array().unwrap().len(), 2);
         }
 
         #[tokio::test]
-        async fn the_listing_body_holds_no_key() {
+        async fn deleting_a_provider_is_204() {
             let temp = TempDb::new();
             let state = state(both(), temp.reopen());
-            let Json(view) = list(State(state)).await;
+            let response = remove(State(state.clone()), HeaderMap::new(), Path(CLOUD_NAME.into())).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(state.models.active(), LOCAL_ID);
+        }
 
-            let body = serde_json::to_string(&view).unwrap();
-            assert!(!body.contains(KEY), "key leaked into /models: {body}");
-            assert_eq!(view["active"], LOCAL_ID);
-            assert_eq!(view["profiles"].as_array().unwrap().len(), 2);
+        #[tokio::test]
+        async fn switching_to_an_unreachable_local_server_is_409() {
+            let temp = TempDb::new();
+            let providers = providers_from_config(Config {
+                cloud_key: Some(KEY.into()),
+                local_base: Some("http://127.0.0.1:1/v1".into()),
+                local_models: Some(LOCAL_MODEL.into()),
+                ..Config::default()
+            })
+            .unwrap();
+            let state = state(providers, temp.reopen());
+            state.models.activate(CLOUD_ID);
+            assert_eq!(put(&state, LOCAL_ID).await, StatusCode::CONFLICT);
+            assert_eq!(state.models.active(), CLOUD_ID);
+        }
+
+        #[tokio::test]
+        async fn upserting_without_a_bearer_is_401_when_gated() {
+            use crate::auth::testing::{SECRET, token_for};
+            use axum::body::Body;
+            use axum::http::Request;
+            use tower::ServiceExt;
+
+            let temp = TempDb::new();
+            let db = std::sync::Arc::new(temp.reopen());
+            let mut state = crate::testing::state(
+                db,
+                crate::auth::Auth::new(Some(SECRET.into()), false).unwrap(),
+            );
+            state.models = std::sync::Arc::new(models(cloud_only(), None));
+            let app = crate::router(state);
+            let body = r#"{"id":"anthropic","server":"cloud","base":"https://api.anthropic.com/v1","key":"sk","models":"claude-sonnet-4-5"}"#;
+
+            let unauth = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/model/providers")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+            let authed = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/model/providers")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {}", token_for("alice")))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(authed.status(), StatusCode::NO_CONTENT);
         }
     }
 }

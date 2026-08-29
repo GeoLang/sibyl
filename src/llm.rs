@@ -243,6 +243,16 @@ impl StreamAccumulator {
 const THINKING_TEMP: f64 = 0.6;
 const THINKING_TOP_P: f64 = 0.95;
 
+fn explain_transport(err: &reqwest::Error, local: bool) -> String {
+    if local && (err.is_connect() || err.is_timeout()) {
+        "The local model isn't running. Start it, or pick a cloud model in Settings.".into()
+    } else if err.is_connect() {
+        "Could not reach the model server.".into()
+    } else {
+        format!("calling the model: {err:#}")
+    }
+}
+
 pub struct Client {
     http: reqwest::Client,
     api_base: String,
@@ -292,7 +302,10 @@ impl Client {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
-        let response = request.send().await.context("calling the model")?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(err) => bail!("{}", explain_transport(&err, self.api_key.is_none())),
+        };
         self.stream_turn(response).await
     }
 

@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -115,25 +115,26 @@ async fn main() -> Result<()> {
     let host = env_or("SIBYL_HOST", "0.0.0.0");
     let port: u16 = env_parsed("SIBYL_PORT", 8090)?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
-    let specs = models::specs(models::Config {
+    let db = Db::open(&db_path)?;
+    let model_config = models::Config {
         cloud_key: env_var(models::CLOUD_KEY_ENV),
         cloud_base: env_or(models::CLOUD_BASE_ENV, models::DEFAULT_CLOUD_API_BASE),
         cloud_models: env_or(models::CLOUD_MODELS_ENV, models::DEFAULT_CLOUD_MODELS),
         local_base: env_var(models::LOCAL_BASE_ENV),
         local_models: env_var(models::LOCAL_MODELS_ENV),
-    })?;
-    if specs
+    };
+    let providers = models::load_providers(model_config, &db)?;
+    if providers
         .iter()
-        .any(|spec| spec.server == models::Server::Cloud && spec.key.is_none())
+        .any(|provider| provider.server == models::Server::Cloud && provider.key.is_none())
     {
         info!(
-            "cloud profiles are unavailable, {} is not set",
-            models::CLOUD_KEY_ENV
+            "cloud profiles are unavailable until a key is saved in Settings"
         );
     }
-    if let Some(local) = specs
+    if let Some(local) = providers
         .iter()
-        .find(|spec| spec.server == models::Server::Local)
+        .find(|provider| provider.server == models::Server::Local)
     {
         info!("local profiles call {} without authentication", local.base);
     }
@@ -157,10 +158,9 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
-    let db = Db::open(&db_path)?;
     let models = Models::new(
         &http,
-        specs,
+        providers,
         db.get_config(ACTIVE_KEY)?,
         max_tokens,
         thinking,
@@ -204,6 +204,9 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/messages", post(sessions::add_message))
         .route("/models", get(models::list))
         .route("/model", put(models::switch))
+        .route("/model/cloud", put(models::configure))
+        .route("/model/providers", put(models::upsert))
+        .route("/model/providers/{id}", delete(models::remove))
         .route("/runs", post(run::post_run))
         .with_state(state)
 }
@@ -220,14 +223,14 @@ pub mod testing {
     /// route tests
     pub fn state(db: Arc<Db>, auth: Auth) -> AppState {
         let http = reqwest::Client::new();
-        let specs = models::specs(models::Config {
+        let providers = models::providers_from_config(models::Config {
             cloud_key: Some("test-key".into()),
             ..models::Config::default()
         })
         .expect("cloud profile from a key");
         AppState {
             db,
-            models: Arc::new(Models::new(&http, specs, None, None, false)),
+            models: Arc::new(Models::new(&http, providers, None, None, false)),
             catalog: Arc::new(ToolCatalog::new(
                 http,
                 "http://127.0.0.1:1".into(),

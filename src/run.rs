@@ -467,8 +467,16 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
     tools.extend(crate::memory::tool_defs());
     let tools = Arc::new(tools);
     let names = tool_names(&tools);
-    // captured once, so switching profiles mid-run cannot swap the client underneath
-    let client = state.models.active_client();
+    // captured once so a profile switch mid-run cannot swap the client.
+    // unreachable local is swapped for a cloud profile before connect.
+    let previous = state.models.active();
+    let client = match state.models.client_for_run().await {
+        Ok(client) => client,
+        Err(message) => return sink.fail(message).await,
+    };
+    if state.models.active() != previous {
+        let _ = state.db.set_config(crate::models::ACTIVE_KEY, &state.models.active());
+    }
 
     let cycle = Cycle {
         db: &state.db,

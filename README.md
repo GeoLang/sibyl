@@ -37,18 +37,22 @@ Sessions written before sibyl had owners carry no subject, so no authenticated c
 
 ### Model profiles
 
-sibyl builds one profile per model on two servers and you switch between them at runtime.
+sibyl builds one profile per model on any number of named providers and you switch between them at runtime. Env seeds at most two:
 
-- **cloud**, one profile per entry of `SIBYL_CLOUD_MODELS`, all calling `SIBYL_CLOUD_API_BASE` with `SIBYL_CLOUD_API_KEY` as the bearer.
-- **local**, one profile per entry of `SIBYL_LOCAL_MODELS`, all calling `SIBYL_LOCAL_API_BASE` with no key at all.
+- **cloud**, one profile per entry of `SIBYL_CLOUD_MODELS`, calling `SIBYL_CLOUD_API_BASE` with `SIBYL_CLOUD_API_KEY`.
+- **local**, one profile per entry of `SIBYL_LOCAL_MODELS`, calling `SIBYL_LOCAL_API_BASE` with no key.
 
-A profile id is `<server>:<model>`, so `local:Qwen3.5-9B-Q4_K_M` and `cloud:grok-4-1-fast-reasoning`, and its label is `<model> (<server>)`. `GET /models` lists the local profiles first, then the cloud ones.
+Settings can add more of either kind (`PUT /model/providers`): another cloud API with its own base and key, or another local llama-server with its own base and model list. `DELETE /model/providers/{id}` removes one. The list is stored in sqlite and overrides env on the next start.
 
-Without `SIBYL_CLOUD_API_KEY` the cloud profiles are still listed and marked unavailable, so a viewer can grey them out rather than hide them, and switching to one answers 409. Startup fails when neither the key nor a local base is set, which keeps a forgotten key loud. `SIBYL_LOCAL_MODELS` and `SIBYL_LOCAL_API_BASE` have to be set together: either one alone fails startup naming both.
+A profile id is `<server>:<model>`, so `local:Qwen3.5-9B-Q4_K_M` and `cloud:grok-4-1-fast-reasoning`, and its label is `<model> (<server>)`. `GET /models` lists the local profiles first, then the cloud ones, and includes `cloud.base`, `cloud.models` and `cloud.has_key` so the viewer can show the current cloud server without echoing the key. Local profiles also carry `reachable`, from a short `GET {base}/models` probe, so a turned-off host is greyed out rather than looking live.
+
+Without `SIBYL_CLOUD_API_KEY` the cloud profiles are still listed and marked unavailable, so a viewer can grey them out rather than hide them, and switching to one answers 409. The process still starts: a run then fails until Settings saves a key or a local server is configured. `SIBYL_LOCAL_MODELS` and `SIBYL_LOCAL_API_BASE` have to be set together: either one alone fails startup naming both.
 
 The first local profile is active by default, the first cloud one when there is no local server. That choice is stored in sqlite and survives a restart. A stored id naming a profile that is now unavailable or no longer configured, say the key was pulled or the model left the list, falls back to the default rather than starting broken.
 
-The key only ever goes to `SIBYL_CLOUD_API_BASE`. Local profiles send no `Authorization` header and log one line at startup saying so, so point `SIBYL_LOCAL_API_BASE` at a server you trust on a network you trust.
+`PUT /model` switches the active profile. `PUT /model/cloud` rewrites the cloud base, key and model list (`{"base","key","models"}`, each optional) and switches to the first new cloud profile. A missing field keeps the current value; an empty key is 400. The new values are stored in sqlite and override env on the next start. The route needs a platform bearer when the gate is on, because the published port would otherwise take a key from anyone who can reach it.
+
+The key only ever goes to `SIBYL_CLOUD_API_BASE`. Local profiles send no `Authorization` header and log one line at startup saying so, so point `SIBYL_LOCAL_API_BASE` at a server you trust on a network you trust. The viewer never sees the key: `GET /models` has `has_key` and no `key` field.
 
 ## Run
 

@@ -245,7 +245,7 @@ const THINKING_TOP_P: f64 = 0.95;
 
 fn explain_transport(err: &reqwest::Error, local: bool) -> String {
     if local && (err.is_connect() || err.is_timeout()) {
-        "The local model isn't running. Start it, or pick a cloud model in Settings.".into()
+        crate::models::LOCAL_DOWN_MESSAGE.into()
     } else if err.is_connect() {
         "Could not reach the model server.".into()
     } else {

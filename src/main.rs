@@ -128,9 +128,7 @@ async fn main() -> Result<()> {
         .iter()
         .any(|provider| provider.server == models::Server::Cloud && provider.key.is_none())
     {
-        info!(
-            "cloud profiles are unavailable until a key is saved in Settings"
-        );
+        info!("cloud profiles are unavailable until a key is saved in Settings");
     }
     if let Some(local) = providers
         .iter()

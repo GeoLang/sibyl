@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-29: **a down local host fails the run instead of switching to cloud.**
+  `client_for_run` used to activate the first cloud profile and persist it when
+  the active local host did not answer, so a prompt meant for a local model
+  went to the cloud API. Now the run fails with the same message the chat shows
+  and the active profile stays put.
 - 2026-08-26: **one switchable profile per model, on a cloud server and a local
   one**. `XAI_API_KEY`, `SIBYL_API_BASE` and `SIBYL_MODEL` are gone, replaced by
   `SIBYL_CLOUD_API_KEY`, `SIBYL_CLOUD_API_BASE` (default `https://api.x.ai/v1`),

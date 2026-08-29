@@ -43,6 +43,9 @@ pub const PROVIDERS_KEY: &str = "providers";
 
 const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+pub const LOCAL_DOWN_MESSAGE: &str =
+    "The local model isn't running. Start it, or pick a cloud model in Settings.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Server {
@@ -193,13 +196,6 @@ pub fn providers_from_config(config: Config) -> Result<Vec<Provider>> {
     Ok(providers)
 }
 
-pub fn specs(config: Config) -> Result<Vec<Spec>> {
-    Ok(providers_from_config(config)?
-        .iter()
-        .flat_map(Provider::to_specs)
-        .collect())
-}
-
 fn present_stored(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -240,12 +236,11 @@ fn valid_base(base: &str) -> bool {
 fn slug(raw: &str, server: Server) -> String {
     let mut out = String::new();
     for ch in raw.chars().flat_map(char::to_lowercase) {
+        let separator = ch == ' ' || ch == '-' || ch == '_';
         if ch.is_ascii_alphanumeric() {
             out.push(ch);
-        } else if ch == ' ' || ch == '-' || ch == '_' {
-            if !out.ends_with('-') && !out.is_empty() {
-                out.push('-');
-            }
+        } else if separator && !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
         }
     }
     let out = out.trim_matches('-').to_string();
@@ -386,7 +381,12 @@ impl Models {
         self.inner.lock().expect("models mutex")
     }
 
-    fn rebuild_locked(inner: &mut Inner, http: &reqwest::Client, max_tokens: Option<u32>, thinking: bool) {
+    fn rebuild_locked(
+        inner: &mut Inner,
+        http: &reqwest::Client,
+        max_tokens: Option<u32>,
+        thinking: bool,
+    ) {
         inner.profiles = profiles_from(http, &inner.providers, max_tokens, thinking);
         if !inner
             .profiles
@@ -435,24 +435,18 @@ impl Models {
 
     fn profile_meta(&self, id: &str) -> Option<(Server, String, String)> {
         let inner = self.inner();
-        inner.profiles.iter().find(|profile| profile.id == id).map(|profile| {
-            (profile.server, profile.provider.clone(), profile.id.clone())
-        })
+        inner
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| (profile.server, profile.provider.clone(), profile.id.clone()))
     }
 
     pub fn activate(&self, id: &str) {
         self.inner().active = id.to_string();
     }
 
-    fn first_available_cloud_id(&self) -> Option<String> {
-        self.inner()
-            .profiles
-            .iter()
-            .find(|profile| profile.server == Server::Cloud && profile.available())
-            .map(|profile| profile.id.clone())
-    }
-
-    /// unreachable local falls back to the first reachable cloud profile
+    /// a local host that is down fails the run and keeps the chosen profile
     pub async fn client_for_run(&self) -> Result<Arc<Client>, String> {
         let Some(client) = self.active_client() else {
             return Err("No model is configured. Add one in Settings.".into());
@@ -461,18 +455,10 @@ impl Models {
             return Ok(client);
         };
         let reach = self.probe_locals().await;
-        if reach.get(&provider) != Some(&false) {
-            return Ok(client);
+        if reach.get(&provider) == Some(&false) {
+            return Err(LOCAL_DOWN_MESSAGE.into());
         }
-        let Some(cloud_id) = self.first_available_cloud_id() else {
-            return Err(
-                "The local model isn't running. Start it, or add a cloud API in Settings.".into(),
-            );
-        };
-        self.activate(&cloud_id);
-        self.active_client().ok_or_else(|| {
-            "The local model isn't running. Start it, or add a cloud API in Settings.".into()
-        })
+        Ok(client)
     }
 
     pub fn view(&self) -> Value {
@@ -548,9 +534,15 @@ impl Models {
             .filter(|provider| provider.server == Server::Local)
             .map(|provider| (provider.id.clone(), provider.base.clone()))
             .collect();
-        let mut out = HashMap::new();
+        let mut probes = tokio::task::JoinSet::new();
         for (id, base) in locals {
-            out.insert(id, probe_base(&base).await);
+            let http = self.http.clone();
+            probes.spawn(async move { (id, probe_base(&http, &base).await) });
+        }
+        let mut out = HashMap::new();
+        while let Some(probe) = probes.join_next().await {
+            let (id, reachable) = probe.expect("local probe task");
+            out.insert(id, reachable);
         }
         out
     }
@@ -563,7 +555,10 @@ impl Models {
             .and_then(|id| inner.providers.iter().find(|provider| provider.id == id))
             .cloned();
 
-        let server = match update.server.or(existing.as_ref().map(|provider| provider.server)) {
+        let server = match update
+            .server
+            .or(existing.as_ref().map(|provider| provider.server))
+        {
             Some(server) => server,
             None => return Err(CloudError::Invalid("server must be cloud or local")),
         };
@@ -619,7 +614,6 @@ impl Models {
             .unwrap_or_else(|| server.name().to_string());
         let id = match update.id.filter(|id| !id.trim().is_empty()) {
             Some(id) => id.trim().to_string(),
-            None if existing.is_some() => existing.as_ref().unwrap().id.clone(),
             None => unique_id(&slug(&label, server), &inner.providers),
         };
 
@@ -721,15 +715,9 @@ fn fallback_id(profiles: &[Profile]) -> String {
         .unwrap_or_default()
 }
 
-async fn probe_base(base: &str) -> bool {
-    let Ok(client) = reqwest::Client::builder()
+async fn probe_base(http: &reqwest::Client, base: &str) -> bool {
+    http.get(format!("{base}/models"))
         .timeout(LOCAL_PROBE_TIMEOUT)
-        .build()
-    else {
-        return false;
-    };
-    client
-        .get(format!("{base}/models"))
         .send()
         .await
         .map(|response| response.status().is_success())
@@ -811,35 +799,22 @@ pub struct Upserted {
     pub key: Option<String>,
 }
 
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    state
-        .auth
-        .subject(auth::bearer(headers))
-        .map(|_| ())
-        .map_err(|err| err.into_response())
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), auth::AuthError> {
+    state.auth.subject(auth::bearer(headers)).map(|_| ())
 }
 
-fn persist_state(state: &AppState) -> Result<(), Response> {
-    let json = match state.models.stored_json() {
-        Ok(json) => json,
-        Err(err) => return Err(ApiError::from(err).into_response()),
-    };
-    if let Err(err) = state.db.set_config(PROVIDERS_KEY, &json) {
-        return Err(ApiError::from(err).into_response());
-    }
-    if let Err(err) = state.db.set_config(ACTIVE_KEY, &state.models.active()) {
-        return Err(ApiError::from(err).into_response());
-    }
+fn persist_state(state: &AppState) -> Result<(), ApiError> {
+    let json = state.models.stored_json()?;
+    state.db.set_config(PROVIDERS_KEY, &json)?;
+    state.db.set_config(ACTIVE_KEY, &state.models.active())?;
     Ok(())
 }
 
 fn cloud_err(err: CloudError) -> Response {
     match err {
-        CloudError::Invalid(reason) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": reason })),
-        )
-            .into_response(),
+        CloudError::Invalid(reason) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response()
+        }
         CloudError::Unreachable => StatusCode::CONFLICT.into_response(),
         CloudError::UnknownProvider => StatusCode::NOT_FOUND.into_response(),
     }
@@ -850,8 +825,8 @@ pub async fn configure(
     headers: HeaderMap,
     Json(payload): Json<CloudPayload>,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
+    if let Err(err) = require_auth(&state, &headers) {
+        return err.into_response();
     }
     if let Err(err) = state.models.configure_cloud(CloudUpdate {
         base: payload.base,
@@ -860,8 +835,8 @@ pub async fn configure(
     }) {
         return cloud_err(err);
     }
-    if let Err(response) = persist_state(&state) {
-        return response;
+    if let Err(err) = persist_state(&state) {
+        return err.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -871,8 +846,8 @@ pub async fn upsert(
     headers: HeaderMap,
     Json(payload): Json<ProviderPayload>,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
+    if let Err(err) = require_auth(&state, &headers) {
+        return err.into_response();
     }
     let server = match payload.server.as_deref() {
         None => None,
@@ -897,8 +872,8 @@ pub async fn upsert(
     }) {
         return cloud_err(err);
     }
-    if let Err(response) = persist_state(&state) {
-        return response;
+    if let Err(err) = persist_state(&state) {
+        return err.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -908,20 +883,27 @@ pub async fn remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers) {
-        return response;
+    if let Err(err) = require_auth(&state, &headers) {
+        return err.into_response();
     }
     if let Err(err) = state.models.remove_provider(&id) {
         return cloud_err(err);
     }
-    if let Err(response) = persist_state(&state) {
-        return response;
+    if let Err(err) = persist_state(&state) {
+        return err.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    fn specs(config: Config) -> Result<Vec<Spec>> {
+        Ok(providers_from_config(config)?
+            .iter()
+            .flat_map(Provider::to_specs)
+            .collect())
+    }
+
     use super::*;
 
     const KEY: &str = "xai-super-secret-key";
@@ -972,7 +954,11 @@ mod tests {
     fn a_model_list_drops_spaces_and_empty_entries() {
         assert_eq!(
             parse_models(" grok-4 , qwen3 ,, ,glm-5 "),
-            vec!["grok-4".to_string(), "qwen3".to_string(), "glm-5".to_string()]
+            vec![
+                "grok-4".to_string(),
+                "qwen3".to_string(),
+                "glm-5".to_string()
+            ]
         );
         assert!(parse_models(" , ").is_empty());
     }
@@ -1004,9 +990,11 @@ mod tests {
         assert_eq!(specs[1].server, Server::Local);
         assert_eq!(specs[2].server, Server::Cloud);
         for spec in specs.iter().take(2) {
-            assert_eq!(spec.key, None);
+            assert_eq!(spec.base, LOCAL_BASE);
+            assert_eq!(spec.key, None, "the cloud key reached the local server");
             assert_eq!(spec.provider, LOCAL_NAME);
         }
+        assert_eq!(specs[2].key.as_deref(), Some(KEY));
     }
 
     #[test]
@@ -1097,10 +1085,7 @@ mod tests {
             .iter()
             .map(|profile| profile["id"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            profile_ids,
-            vec![CLOUD_ID, "anthropic:claude-sonnet-4-5"]
-        );
+        assert_eq!(profile_ids, vec![CLOUD_ID, "anthropic:claude-sonnet-4-5"]);
         assert_eq!(models.active(), "anthropic:claude-sonnet-4-5");
         let body = serde_json::to_string(&view).unwrap();
         assert!(!body.contains("sk-ant"), "{body}");
@@ -1162,7 +1147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_falls_back_to_cloud_when_local_is_down() {
+    async fn a_run_on_a_down_local_host_fails_and_keeps_the_choice() {
         let providers = providers_from_config(Config {
             cloud_key: Some(KEY.into()),
             local_base: Some("http://127.0.0.1:1/v1".into()),
@@ -1172,9 +1157,9 @@ mod tests {
         .unwrap();
         let models = models(providers, Some(LOCAL_ID));
         assert_eq!(models.active(), LOCAL_ID);
-        let client = models.client_for_run().await.unwrap();
-        assert_eq!(client.model(), DEFAULT_CLOUD_MODELS);
-        assert_eq!(models.active(), CLOUD_ID);
+        let err = models.client_for_run().await.err();
+        assert_eq!(err.as_deref(), Some(LOCAL_DOWN_MESSAGE));
+        assert_eq!(models.active(), LOCAL_ID);
     }
 
     #[test]
@@ -1182,7 +1167,10 @@ mod tests {
         let models = models(both(), None);
         assert_eq!(models.active_client().unwrap().model(), LOCAL_MODEL);
         models.activate(&models.resolve(CLOUD_ID).unwrap());
-        assert_eq!(models.active_client().unwrap().model(), DEFAULT_CLOUD_MODELS);
+        assert_eq!(
+            models.active_client().unwrap().model(),
+            DEFAULT_CLOUD_MODELS
+        );
     }
 
     #[test]
@@ -1265,8 +1253,7 @@ mod tests {
                 models: Some("grok-4".into()),
             })
             .unwrap();
-        let ids: Vec<String> = models
-            .view()["providers"]
+        let ids: Vec<String> = models.view()["providers"]
             .as_array()
             .unwrap()
             .iter()
@@ -1361,7 +1348,12 @@ mod tests {
         async fn deleting_a_provider_is_204() {
             let temp = TempDb::new();
             let state = state(both(), temp.reopen());
-            let response = remove(State(state.clone()), HeaderMap::new(), Path(CLOUD_NAME.into())).await;
+            let response = remove(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path(CLOUD_NAME.into()),
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
             assert_eq!(state.models.active(), LOCAL_ID);
         }

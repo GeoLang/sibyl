@@ -1115,6 +1115,36 @@ mod tests {
         assert_eq!(stored.iter().filter(|m| m.role == "tool").count(), 3);
     }
 
+    /// the model kept re-issuing a viewer call that had already done its job
+    #[tokio::test]
+    async fn a_thrice_repeated_call_with_the_same_answer_aborts_the_run() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat", None).unwrap();
+        let turn = Turn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "viewer_control", r#"{"name":"renderer.set"}"#),
+                call("c2", "viewer_control", r#"{"name":"renderer.set"}"#),
+                call("c3", "viewer_control", r#"{"name":"renderer.set"}"#),
+            ],
+        };
+
+        let (sink, rx) = sink_and_events();
+        let err = execute_turn(
+            &temp.db,
+            &session.id,
+            &turn,
+            |_name, _args| async { "__VIEWER_CMD__:{}".to_string() },
+            &sink,
+            &mut RepeatGuard::default(),
+        )
+        .await
+        .unwrap_err();
+        drop(rx);
+
+        assert!(err.to_string().contains("3 times in a row"), "{err}");
+    }
+
     #[test]
     fn the_guard_resets_on_success_or_different_arguments() {
         let mut guard = RepeatGuard::default();

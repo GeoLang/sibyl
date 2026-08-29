@@ -406,6 +406,18 @@ struct Cycle<'a> {
 }
 
 impl Cycle<'_> {
+    /// leaves the failure in the session so the next turn reads this request as closed
+    async fn abort(&self, err: impl std::fmt::Display) {
+        let note = format!("I could not finish: {err:#}");
+        if let Err(store) = self
+            .db
+            .append_message(self.session_id, &NewMessage::assistant(Some(note), None))
+        {
+            warn!("could not record the failed run: {store:#}");
+        }
+        self.sink.fail(err).await;
+    }
+
     /// the agent loop, with the model and tool calls injected so tests can count
     /// model calls and cut the client off partway through
     async fn drive<M, MFut, S, SFut, E, EFut>(&self, call_model: M, summarize: S, execute: E)
@@ -428,17 +440,17 @@ impl Cycle<'_> {
                 return;
             }
             if let Some(exhausted) = self.limits.exhausted(calls, started.elapsed()) {
-                return self.sink.fail(exhausted).await;
+                return self.abort(exhausted).await;
             }
             calls += 1;
             let messages =
                 match assemble(self.db, self.session_id, self.system_prompt, &summarize).await {
                     Ok(messages) => messages,
-                    Err(err) => return self.sink.fail(err).await,
+                    Err(err) => return self.abort(err).await,
                 };
             let turn = match call_model(messages).await {
                 Ok(turn) => turn,
-                Err(err) => return self.sink.fail(err).await,
+                Err(err) => return self.abort(err).await,
             };
             let turn = crate::salvage::salvage_turn(turn, self.names);
             match execute_turn(
@@ -453,7 +465,7 @@ impl Cycle<'_> {
             {
                 Ok(true) => continue,
                 Ok(false) => return self.sink.send(Event::Done).await,
-                Err(err) => return self.sink.fail(err).await,
+                Err(err) => return self.abort(err).await,
             }
         }
     }
@@ -795,6 +807,48 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "the loop kept calling the model after the client left"
+        );
+    }
+
+    /// the next prompt then reads this one as closed rather than still pending
+    #[tokio::test]
+    async fn a_failed_model_call_leaves_a_closing_note_in_the_session() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat", None).unwrap();
+        let (sink, rx) = sink_and_events();
+        let names: HashSet<&str> = HashSet::new();
+        let cycle = Cycle {
+            db: &temp.db,
+            session_id: &session.id,
+            system_prompt: "you are a test",
+            limits: RunLimits::default(),
+            names: &names,
+            sink: &sink,
+        };
+
+        cycle
+            .drive(
+                |_messages| async { Err(anyhow::anyhow!("Could not reach the model server.")) },
+                |_older| async { unreachable!("history is too short to summarize") },
+                |_name, _args| async { unreachable!("no tool call to run") },
+            )
+            .await;
+
+        let stored = temp.db.messages_after(&session.id, 0).unwrap();
+        let last = stored.last().expect("the note");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(
+            last.content.as_deref(),
+            Some("I could not finish: Could not reach the model server.")
+        );
+        assert_eq!(
+            drain(sink, rx).await,
+            vec![
+                Event::Error {
+                    message: "Could not reach the model server.".into()
+                },
+                Event::Done,
+            ]
         );
     }
 

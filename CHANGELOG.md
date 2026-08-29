@@ -25,6 +25,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-29: **a failed run leaves a closing note in the session.** When the
+  model call or a tool fails partway, sibyl appends an assistant message
+  "I could not finish: <error>" before ending the stream, so the next prompt
+  reads the earlier request as closed instead of finishing it unasked.
 - 2026-08-29: **a down local host fails the run instead of switching to cloud.**
   `client_for_run` used to activate the first cloud profile and persist it when
   the active local host did not answer, so a prompt meant for a local model

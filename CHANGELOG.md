@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-29: **a call repeated with the same result stops the run.** The
+  repeat guard used to count only identical failures. A tool called three
+  times in a row with the same arguments and the same result now aborts the
+  run too, so a model that keeps re-issuing a call that already did its job
+  cannot burn the budget.
 - 2026-08-29: **a failed run leaves a closing note in the session.** When the
   model call or a tool fails partway, sibyl appends an assistant message
   "I could not finish: <error>" before ending the stream, so the next prompt

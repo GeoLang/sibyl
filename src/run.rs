@@ -156,35 +156,31 @@ pub fn truncate_tool_output(output: &str) -> String {
 
 /// a model that repeats the same failing tool call verbatim has stopped
 /// adapting (grok once burned a whole run on 30 identical emit_ui_spec
-/// errors), so the run aborts after this many identical failures in a row
-pub const MAX_IDENTICAL_FAILURES: usize = 3;
+/// errors) or repeats a call that already did its job, so the run aborts after
+/// this many calls in a row with the same arguments and the same result
+pub const MAX_IDENTICAL_CALLS: usize = 3;
 
 #[derive(Default)]
 pub struct RepeatGuard {
-    last: Option<(String, String)>,
-    failures: usize,
+    last: Option<(String, String, String)>,
+    repeats: usize,
 }
 
 impl RepeatGuard {
-    /// records one tool result; true when the same call just failed
-    /// MAX_IDENTICAL_FAILURES times in a row
+    /// records one tool result; true when the same call just returned the same
+    /// thing MAX_IDENTICAL_CALLS times in a row
     fn tripped(&mut self, name: &str, args: &str, result: &str) -> bool {
-        if !(result.starts_with("❌") || result.starts_with("ERROR")) {
-            self.last = None;
-            self.failures = 0;
-            return false;
-        }
         let same = self
             .last
             .as_ref()
-            .is_some_and(|(n, a)| n == name && a == args);
+            .is_some_and(|(n, a, r)| n == name && a == args && r == result);
         if same {
-            self.failures += 1;
+            self.repeats += 1;
         } else {
-            self.last = Some((name.to_string(), args.to_string()));
-            self.failures = 1;
+            self.last = Some((name.to_string(), args.to_string(), result.to_string()));
+            self.repeats = 1;
         }
-        self.failures >= MAX_IDENTICAL_FAILURES
+        self.repeats >= MAX_IDENTICAL_CALLS
     }
 }
 
@@ -366,8 +362,9 @@ where
         )?;
         if guard.tripped(&call.function.name, &call.function.arguments, &result) {
             anyhow::bail!(
-                "tool '{}' failed {MAX_IDENTICAL_FAILURES} times in a row with identical \
-                 arguments; aborting the run instead of burning the rest of the budget",
+                "tool '{}' was called {MAX_IDENTICAL_CALLS} times in a row with identical \
+                 arguments and the same result; aborting the run instead of burning the \
+                 rest of the budget",
                 call.function.name
             );
         }
@@ -1135,6 +1132,16 @@ mod tests {
         assert!(!guard.tripped("t", "{}", "❌ boom"));
         assert!(!guard.tripped("t", "{}", "❌ boom"));
         assert!(guard.tripped("t", "{}", "❌ boom"));
+        // the same call answering the same thing three times is a loop even when it worked
+        let mut guard = RepeatGuard::default();
+        assert!(!guard.tripped("viewer_control", "{}", "__VIEWER_CMD__:{}"));
+        assert!(!guard.tripped("viewer_control", "{}", "__VIEWER_CMD__:{}"));
+        assert!(guard.tripped("viewer_control", "{}", "__VIEWER_CMD__:{}"));
+        // a repeated query that keeps answering differently is polling, not looping
+        let mut guard = RepeatGuard::default();
+        assert!(!guard.tripped("q", "{}", "1"));
+        assert!(!guard.tripped("q", "{}", "2"));
+        assert!(!guard.tripped("q", "{}", "3"));
     }
 
     fn seed_overflow(db: &Db, session_id: &str, count: usize) {

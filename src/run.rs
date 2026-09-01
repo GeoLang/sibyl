@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -97,6 +97,10 @@ pub struct RunRequest {
     /// on every tool call of this run so a tool can read that map's state.
     #[serde(default)]
     pub document: Option<String>,
+    /// the exact model profile id this run uses, as `GET /models` lists them.
+    /// absent uses the active profile, and a pinned one never changes it.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// per-run ceilings, both operator-tunable. the wall clock one exists because a
@@ -468,7 +472,13 @@ impl Cycle<'_> {
     }
 }
 
-async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: &EventSink) {
+async fn agent_loop(
+    state: &AppState,
+    session_id: &str,
+    req: &RunRequest,
+    profile: &str,
+    sink: &EventSink,
+) {
     let mut tools = match state.catalog.tools().await {
         Ok(tools) => tools,
         Err(err) => return sink.fail(err).await,
@@ -477,7 +487,7 @@ async fn agent_loop(state: &AppState, session_id: &str, req: &RunRequest, sink: 
     let tools = Arc::new(tools);
     let names = tool_names(&tools);
     // captured once so a profile switch mid-run cannot swap the client
-    let client = match state.models.client_for_run().await {
+    let client = match state.models.client_for_run(profile).await {
         Ok(client) => client,
         Err(message) => return sink.fail(message).await,
     };
@@ -580,6 +590,12 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         Ok(subject) => subject,
         Err(err) => return err.into_response(),
     };
+    let profile = match state.models.profile_for_run(req.profile.as_deref()) {
+        Ok(profile) => profile,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
 
     let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(64);
     let sink = EventSink::new(tx);
@@ -604,7 +620,7 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         {
             return sink.fail(err).await;
         }
-        agent_loop(&state, &session.id, &req, &sink).await;
+        agent_loop(&state, &session.id, &req, &profile, &sink).await;
     });
 
     (
@@ -660,6 +676,67 @@ mod tests {
             bound.document.as_deref(),
             Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301")
         );
+    }
+
+    /// a sweep pins the profile so a mid-sweep switch cannot move it
+    #[test]
+    fn the_profile_is_optional_on_a_run_request() {
+        let unpinned: RunRequest =
+            serde_json::from_str(r#"{"system_prompt":"s","message":"m"}"#).unwrap();
+        assert!(unpinned.profile.is_none());
+
+        let pinned: RunRequest = serde_json::from_str(
+            r#"{"system_prompt":"s","message":"m","profile":"local:Qwen3.5-35B-A3B"}"#,
+        )
+        .unwrap();
+        assert_eq!(pinned.profile.as_deref(), Some("local:Qwen3.5-35B-A3B"));
+    }
+
+    /// the 401 gate stays in front of the profile check
+    #[tokio::test]
+    async fn an_unknown_profile_is_400_and_a_missing_bearer_is_still_401() {
+        use crate::auth::testing::{SECRET, token_for};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp = TempDb::new();
+        let db = std::sync::Arc::new(temp.reopen());
+        let state = crate::testing::state(
+            db,
+            crate::auth::Auth::new(Some(SECRET.into()), false).unwrap(),
+        );
+        let app = crate::router(state);
+        let post = |token: Option<String>| {
+            let body = match &token {
+                Some(token) => format!(
+                    r#"{{"system_prompt":"s","message":"m","user_token":"{token}","profile":"local:nope"}}"#
+                ),
+                None => r#"{"system_prompt":"s","message":"m","profile":"local:nope"}"#.to_string(),
+            };
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let unauth = post(None).await.unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = post(Some(token_for("alice"))).await.unwrap();
+        assert_eq!(authed.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(authed.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let error = serde_json::from_slice::<Value>(&bytes).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("local:nope"), "{error}");
+        assert!(error.contains(crate::models::PROFILE_LIST_HINT), "{error}");
     }
 
     #[test]

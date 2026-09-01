@@ -49,6 +49,8 @@ const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const LOCAL_DOWN_MESSAGE: &str =
     "The local model isn't running. Start it, or pick a cloud model in Settings.";
 
+pub const PROFILE_LIST_HINT: &str = "GET /models lists the valid profile ids.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Server {
@@ -430,13 +432,17 @@ impl Models {
         self.inner().active.clone()
     }
 
-    pub fn active_client(&self) -> Option<Arc<Client>> {
+    pub fn client_for(&self, id: &str) -> Option<Arc<Client>> {
         let inner = self.inner();
         inner
             .profiles
             .iter()
-            .find(|profile| profile.id == inner.active)
+            .find(|profile| profile.id == id)
             .and_then(|profile| profile.client.clone())
+    }
+
+    pub fn active_client(&self) -> Option<Arc<Client>> {
+        self.client_for(&self.active())
     }
 
     pub fn active_label(&self) -> String {
@@ -475,12 +481,28 @@ impl Models {
         self.inner().active = id.to_string();
     }
 
+    /// the profile a run uses: the id the request pins, else the active one
+    pub fn profile_for_run(&self, requested: Option<&str>) -> Result<String, String> {
+        let Some(requested) = requested else {
+            return Ok(self.active());
+        };
+        match self.resolve(requested) {
+            Ok(id) => Ok(id),
+            Err(SwitchError::Unknown) => Err(format!(
+                "unknown model profile \"{requested}\". {PROFILE_LIST_HINT}"
+            )),
+            Err(SwitchError::Unavailable) => Err(format!(
+                "model profile \"{requested}\" is not available. {PROFILE_LIST_HINT}"
+            )),
+        }
+    }
+
     /// a local host that is down fails the run and keeps the chosen profile
-    pub async fn client_for_run(&self) -> Result<Arc<Client>, String> {
-        let Some(client) = self.active_client() else {
+    pub async fn client_for_run(&self, id: &str) -> Result<Arc<Client>, String> {
+        let Some(client) = self.client_for(id) else {
             return Err("No model is configured. Add one in Settings.".into());
         };
-        let Some((Server::Local, provider, _)) = self.profile_meta(&self.active()) else {
+        let Some((Server::Local, provider, _)) = self.profile_meta(id) else {
             return Ok(client);
         };
         let reach = self.probe_locals().await;
@@ -1260,9 +1282,52 @@ mod tests {
         .unwrap();
         let models = models(providers, Some(LOCAL_ID));
         assert_eq!(models.active(), LOCAL_ID);
-        let err = models.client_for_run().await.err();
+        let err = models.client_for_run(LOCAL_ID).await.err();
         assert_eq!(err.as_deref(), Some(LOCAL_DOWN_MESSAGE));
         assert_eq!(models.active(), LOCAL_ID);
+    }
+
+    #[test]
+    fn a_run_without_a_pinned_profile_uses_the_active_one() {
+        let models = models(both(), Some(CLOUD_ID));
+        assert_eq!(models.profile_for_run(None).unwrap(), CLOUD_ID);
+    }
+
+    #[test]
+    fn a_pinned_profile_resolves_without_touching_the_active_one() {
+        let models = models(both(), Some(CLOUD_ID));
+        assert_eq!(models.profile_for_run(Some(LOCAL_ID)).unwrap(), LOCAL_ID);
+        assert_eq!(models.active(), CLOUD_ID);
+        assert_eq!(
+            models.client_for(LOCAL_ID).unwrap().model(),
+            LOCAL_MODEL,
+            "the pinned id has to reach its own client"
+        );
+    }
+
+    #[test]
+    fn an_unknown_pinned_profile_names_it_and_points_at_the_listing() {
+        let err = models(both(), None)
+            .profile_for_run(Some("local:not-a-model"))
+            .unwrap_err();
+        assert!(err.contains("local:not-a-model"), "{err}");
+        assert!(err.contains(PROFILE_LIST_HINT), "{err}");
+    }
+
+    #[test]
+    fn an_unavailable_pinned_profile_is_refused_like_an_unknown_one() {
+        // local_only leaves the cloud profile keyless, so it exists and has no client
+        let providers = providers_from_config(Config {
+            local_base: Some(LOCAL_BASE.into()),
+            local_models: Some(LOCAL_MODEL.into()),
+            ..Config::default()
+        })
+        .unwrap();
+        let err = models(providers, None)
+            .profile_for_run(Some(CLOUD_ID))
+            .unwrap_err();
+        assert!(err.contains(CLOUD_ID), "{err}");
+        assert!(err.contains(PROFILE_LIST_HINT), "{err}");
     }
 
     #[test]

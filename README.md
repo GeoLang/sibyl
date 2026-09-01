@@ -129,6 +129,8 @@ Keep system prompts explicit about when to call what, keep tool schemas small, a
 
 `SIBYL_LOCAL2_API_BASE` and `SIBYL_LOCAL2_MODELS` seed a second local provider whose id and label are `local2`, so its profiles read `local2:<model>`. The pair follows the same rules as the first: both set or neither, trailing slash stripped, no `Authorization` header, and the same `GET {base}/models` reachability probe. Use it when two llama-servers run at once, say a small model on this box and a larger one over the tunnel below.
 
+Both env pairs are seeds only. Once a provider list is stored in sqlite, by the Settings panel or `PUT /model/providers`, that list wins and the env pairs are ignored, and startup logs say so. On a deployment with stored providers, add a server with `PUT /model/providers` instead of env, it takes effect with no restart.
+
 ```
 SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M \
   SIBYL_LOCAL2_API_BASE=http://host.docker.internal:18200/v1 SIBYL_LOCAL2_MODELS=Qwen3.5-35B-A3B \

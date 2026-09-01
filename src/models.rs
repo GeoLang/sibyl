@@ -246,6 +246,10 @@ pub fn load_providers(config: Config, db: &Db) -> Result<Vec<Provider>> {
         && let Ok(stored) = serde_json::from_str::<Vec<Provider>>(&raw)
         && !stored.is_empty()
     {
+        tracing::info!(
+            "{} stored providers from Settings override the SIBYL_* env config",
+            stored.len()
+        );
         return Ok(stored);
     }
     let mut config = config;

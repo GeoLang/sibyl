@@ -16,6 +16,8 @@ Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat com
 | `SIBYL_CLOUD_MODELS` | `grok-4-1-fast-reasoning` | comma separated, one profile per model |
 | `SIBYL_LOCAL_API_BASE` | unset | trailing slash is stripped, unset means no local profiles |
 | `SIBYL_LOCAL_MODELS` | unset | comma separated, required when `SIBYL_LOCAL_API_BASE` is set and refused when it is not |
+| `SIBYL_LOCAL2_API_BASE` | unset | second local server, same rules as `SIBYL_LOCAL_API_BASE` |
+| `SIBYL_LOCAL2_MODELS` | unset | comma separated, required when `SIBYL_LOCAL2_API_BASE` is set and refused when it is not |
 | `GEOLANG_URL` | `http://geolang-api:8080` | tool manifest and executor |
 | `SIBYL_TOOL_TIMEOUT_SECS` | `600` | per tool call |
 | `SIBYL_MAX_MODEL_CALLS` | `30` | model calls per run |
@@ -37,22 +39,23 @@ Sessions written before sibyl had owners carry no subject, so no authenticated c
 
 ### Model profiles
 
-sibyl builds one profile per model on any number of named providers and you switch between them at runtime. Env seeds at most two:
+sibyl builds one profile per model on any number of named providers and you switch between them at runtime. Env seeds at most three:
 
 - **cloud**, one profile per entry of `SIBYL_CLOUD_MODELS`, calling `SIBYL_CLOUD_API_BASE` with `SIBYL_CLOUD_API_KEY`.
 - **local**, one profile per entry of `SIBYL_LOCAL_MODELS`, calling `SIBYL_LOCAL_API_BASE` with no key.
+- **local2**, the same for `SIBYL_LOCAL2_MODELS` and `SIBYL_LOCAL2_API_BASE`, for a second local server.
 
 Settings can add more of either kind (`PUT /model/providers`): another cloud API with its own base and key, or another local llama-server with its own base and model list. `DELETE /model/providers/{id}` removes one. The list is stored in sqlite and overrides env on the next start.
 
-A profile id is `<server>:<model>`, so `local:Qwen3.5-9B-Q4_K_M` and `cloud:grok-4-1-fast-reasoning`, and its label is `<model> (<server>)`. `GET /models` lists the local profiles first, then the cloud ones, and includes `cloud.base`, `cloud.models` and `cloud.has_key` so the viewer can show the current cloud server without echoing the key. Local profiles also carry `reachable`, from a short `GET {base}/models` probe, so a turned-off host is greyed out rather than looking live. A run on a local profile whose host is down fails with a message and keeps that profile active: sibyl never switches to a cloud API on its own.
+A profile id is `<provider>:<model>`, so `local:Qwen3.5-9B-Q4_K_M`, `local2:gpt-oss-20b` and `cloud:grok-4-1-fast-reasoning`, and its label is `<model> (<provider>)`. `GET /models` lists the local profiles first, then the cloud ones, and includes `cloud.base`, `cloud.models` and `cloud.has_key` so the viewer can show the current cloud server without echoing the key. Local profiles also carry `reachable`, from a short `GET {base}/models` probe, so a turned-off host is greyed out rather than looking live. A run on a local profile whose host is down fails with a message and keeps that profile active: sibyl never switches to a cloud API on its own.
 
-Without `SIBYL_CLOUD_API_KEY` the cloud profiles are still listed and marked unavailable, so a viewer can grey them out rather than hide them, and switching to one answers 409. The process still starts: a run then fails until Settings saves a key or a local server is configured. `SIBYL_LOCAL_MODELS` and `SIBYL_LOCAL_API_BASE` have to be set together: either one alone fails startup naming both.
+Without `SIBYL_CLOUD_API_KEY` the cloud profiles are still listed and marked unavailable, so a viewer can grey them out rather than hide them, and switching to one answers 409. The process still starts: a run then fails until Settings saves a key or a local server is configured. `SIBYL_LOCAL_MODELS` and `SIBYL_LOCAL_API_BASE` have to be set together: either one alone fails startup naming both, and the `SIBYL_LOCAL2_` pair is checked the same way.
 
 The first local profile is active by default, the first cloud one when there is no local server. That choice is stored in sqlite and survives a restart. A stored id naming a profile that is now unavailable or no longer configured, say the key was pulled or the model left the list, falls back to the default rather than starting broken.
 
 `PUT /model` switches the active profile. `PUT /model/cloud` rewrites the cloud base, key and model list (`{"base","key","models"}`, each optional) and switches to the first new cloud profile. A missing field keeps the current value; an empty key is 400. The new values are stored in sqlite and override env on the next start. The route needs a platform bearer when the gate is on, because the published port would otherwise take a key from anyone who can reach it.
 
-The key only ever goes to `SIBYL_CLOUD_API_BASE`. Local profiles send no `Authorization` header and log one line at startup saying so, so point `SIBYL_LOCAL_API_BASE` at a server you trust on a network you trust. The viewer never sees the key: `GET /models` has `has_key` and no `key` field.
+The key only ever goes to `SIBYL_CLOUD_API_BASE`. Local profiles send no `Authorization` header and log one line per local server at startup saying so, so point `SIBYL_LOCAL_API_BASE` and `SIBYL_LOCAL2_API_BASE` at servers you trust on a network you trust. The viewer never sees the key: `GET /models` has `has_key` and no `key` field.
 
 ## Run
 
@@ -121,6 +124,16 @@ Tool calling on a 9B model is noticeably less reliable than on a frontier model:
 The one exception is tool-call salvage. A small model sometimes prints a tool call as literal text instead of emitting a structured one, and llama-server's parser hands the raw markup straight through to the screen. When a turn comes back with no structured tool calls and its text contains a complete `<tool_call>` block, sibyl parses it and runs it as a normal call, logging a warn naming the dialect. Two dialects are recognized, the Qwen-Coder XML form (`<function=name><parameter=key>value</parameter></function>`) and the Hermes JSON form (`{"name": ..., "arguments": {...}}`). Parsing is strict and never repairs: a block that is incomplete, ambiguous, or names a tool outside the current manifest is left in the text exactly as it arrived. A turn that already carries structured tool calls is never touched, so the cloud path is unaffected. Watch for those warns, since a run that depends on salvage is a sign the model is drifting off its template.
 
 Keep system prompts explicit about when to call what, keep tool schemas small, and stay on a cloud profile wherever a wrong tool call is expensive.
+
+### A second local server
+
+`SIBYL_LOCAL2_API_BASE` and `SIBYL_LOCAL2_MODELS` seed a second local provider whose id and label are `local2`, so its profiles read `local2:<model>`. The pair follows the same rules as the first: both set or neither, trailing slash stripped, no `Authorization` header, and the same `GET {base}/models` reachability probe. Use it when two llama-servers run at once, say a small model on this box and a larger one over the tunnel below.
+
+```
+SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M \
+  SIBYL_LOCAL2_API_BASE=http://host.docker.internal:18200/v1 SIBYL_LOCAL2_MODELS=Qwen3.5-35B-A3B \
+  SIBYL_DB_PATH=./sibyl.db cargo run
+```
 
 ### Model on another machine (shared with liquid)
 

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-09-01: **a second local server from env.** `SIBYL_LOCAL2_API_BASE` and
+  `SIBYL_LOCAL2_MODELS` seed a `local2` provider alongside `local`, with the
+  same paired-or-neither check, trailing slash trim, missing `Authorization`
+  header and reachability probe. Its profiles read `local2:<model>`, and
+  startup logs one unauthenticated line per local server.
 - 2026-08-28: **any number of cloud APIs and local servers.** Each is a named
   provider with its own base, optional key and model list. Env still seeds the
   `cloud` and `local` providers. `PUT /model/providers` adds or updates one,

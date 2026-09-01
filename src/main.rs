@@ -122,6 +122,8 @@ async fn main() -> Result<()> {
         cloud_models: env_or(models::CLOUD_MODELS_ENV, models::DEFAULT_CLOUD_MODELS),
         local_base: env_var(models::LOCAL_BASE_ENV),
         local_models: env_var(models::LOCAL_MODELS_ENV),
+        local2_base: env_var(models::LOCAL2_BASE_ENV),
+        local2_models: env_var(models::LOCAL2_MODELS_ENV),
     };
     let providers = models::load_providers(model_config, &db)?;
     if providers
@@ -130,11 +132,14 @@ async fn main() -> Result<()> {
     {
         info!("cloud profiles are unavailable until a key is saved in Settings");
     }
-    if let Some(local) = providers
+    for local in providers
         .iter()
-        .find(|provider| provider.server == models::Server::Local)
+        .filter(|provider| provider.server == models::Server::Local)
     {
-        info!("local profiles call {} without authentication", local.base);
+        info!(
+            "{} profiles call {} without authentication",
+            local.id, local.base
+        );
     }
     let geolang_url = env_or("GEOLANG_URL", "http://geolang-api:8080");
     let tool_timeout = Duration::from_secs(env_parsed("SIBYL_TOOL_TIMEOUT_SECS", 600u64)?);

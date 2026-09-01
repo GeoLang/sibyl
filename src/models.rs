@@ -25,6 +25,8 @@ pub const CLOUD_BASE_ENV: &str = "SIBYL_CLOUD_API_BASE";
 pub const CLOUD_MODELS_ENV: &str = "SIBYL_CLOUD_MODELS";
 pub const LOCAL_BASE_ENV: &str = "SIBYL_LOCAL_API_BASE";
 pub const LOCAL_MODELS_ENV: &str = "SIBYL_LOCAL_MODELS";
+pub const LOCAL2_BASE_ENV: &str = "SIBYL_LOCAL2_API_BASE";
+pub const LOCAL2_MODELS_ENV: &str = "SIBYL_LOCAL2_MODELS";
 
 pub const DEFAULT_CLOUD_API_BASE: &str = "https://api.x.ai/v1";
 pub const DEFAULT_CLOUD_MODELS: &str = "grok-4-1-fast-reasoning";
@@ -34,6 +36,7 @@ const ID_SEPARATOR: char = ':';
 
 const CLOUD_NAME: &str = "cloud";
 const LOCAL_NAME: &str = "local";
+const LOCAL2_NAME: &str = "local2";
 
 pub const ACTIVE_KEY: &str = "active_model";
 pub const CLOUD_KEY_KEY: &str = "cloud_api_key";
@@ -84,6 +87,8 @@ pub struct Config {
     pub cloud_models: String,
     pub local_base: Option<String>,
     pub local_models: Option<String>,
+    pub local2_base: Option<String>,
+    pub local2_models: Option<String>,
 }
 
 impl Default for Config {
@@ -94,6 +99,8 @@ impl Default for Config {
             cloud_models: DEFAULT_CLOUD_MODELS.to_string(),
             local_base: None,
             local_models: None,
+            local2_base: None,
+            local2_models: None,
         }
     }
 }
@@ -153,32 +160,50 @@ fn parse_models(raw: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn providers_from_config(config: Config) -> Result<Vec<Provider>> {
-    let local_base = config
-        .local_base
-        .map(|base| base.trim_end_matches('/').to_string());
-    let local_models = parse_models(config.local_models.as_deref().unwrap_or_default());
-    match (&local_base, local_models.is_empty()) {
+fn local_provider(
+    name: &str,
+    base_env: &str,
+    models_env: &str,
+    base: Option<String>,
+    models: Option<String>,
+) -> Result<Option<Provider>> {
+    let base = base.map(|base| base.trim_end_matches('/').to_string());
+    let models = parse_models(models.as_deref().unwrap_or_default());
+    match (&base, models.is_empty()) {
         (Some(_), true) => {
-            bail!("{LOCAL_BASE_ENV} is set, so {LOCAL_MODELS_ENV} must name the models it serves")
+            bail!("{base_env} is set, so {models_env} must name the models it serves")
         }
         (None, false) => {
-            bail!("{LOCAL_MODELS_ENV} is set without {LOCAL_BASE_ENV}, so no server serves them")
+            bail!("{models_env} is set without {base_env}, so no server serves them")
         }
         _ => {}
     }
+    Ok(base.map(|base| Provider {
+        id: name.into(),
+        label: name.into(),
+        server: Server::Local,
+        base,
+        key: None,
+        models,
+    }))
+}
 
+pub fn providers_from_config(config: Config) -> Result<Vec<Provider>> {
     let mut providers = Vec::new();
-    if let Some(base) = local_base {
-        providers.push(Provider {
-            id: LOCAL_NAME.into(),
-            label: LOCAL_NAME.into(),
-            server: Server::Local,
-            base,
-            key: None,
-            models: local_models,
-        });
-    }
+    providers.extend(local_provider(
+        LOCAL_NAME,
+        LOCAL_BASE_ENV,
+        LOCAL_MODELS_ENV,
+        config.local_base,
+        config.local_models,
+    )?);
+    providers.extend(local_provider(
+        LOCAL2_NAME,
+        LOCAL2_BASE_ENV,
+        LOCAL2_MODELS_ENV,
+        config.local2_base,
+        config.local2_models,
+    )?);
     let cloud_models = parse_models(&config.cloud_models);
     if !cloud_models.is_empty() {
         providers.push(Provider {
@@ -908,6 +933,7 @@ mod tests {
 
     const KEY: &str = "xai-super-secret-key";
     const LOCAL_BASE: &str = "http://127.0.0.1:18099/v1";
+    const LOCAL2_BASE: &str = "http://127.0.0.1:18100/v1";
     const LOCAL_MODEL: &str = "Qwen3.5-9B-Q4_K_M";
     const CLOUD_ID: &str = "cloud:grok-4-1-fast-reasoning";
     const LOCAL_ID: &str = "local:Qwen3.5-9B-Q4_K_M";
@@ -1033,6 +1059,79 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(LOCAL_BASE_ENV), "{err}");
+    }
+
+    #[test]
+    fn both_local_pairs_give_two_local_providers() {
+        let providers = providers_from_config(Config {
+            cloud_key: Some(KEY.into()),
+            local_base: Some(LOCAL_BASE.into()),
+            local_models: Some(LOCAL_MODEL.into()),
+            local2_base: Some(format!("{LOCAL2_BASE}/")),
+            local2_models: Some("gpt-oss-20b".into()),
+            ..Config::default()
+        })
+        .unwrap();
+        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec![LOCAL_NAME, LOCAL2_NAME, CLOUD_NAME]);
+        assert_eq!(providers[1].base, LOCAL2_BASE);
+        assert_eq!(providers[1].label, LOCAL2_NAME);
+        assert_eq!(providers[1].server, Server::Local);
+        assert_eq!(providers[1].key, None);
+        let specs = specs(Config {
+            cloud_key: Some(KEY.into()),
+            local_base: Some(LOCAL_BASE.into()),
+            local_models: Some(LOCAL_MODEL.into()),
+            local2_base: Some(LOCAL2_BASE.into()),
+            local2_models: Some("gpt-oss-20b".into()),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(
+            format!("{}{ID_SEPARATOR}{}", specs[1].provider, specs[1].model),
+            "local2:gpt-oss-20b"
+        );
+    }
+
+    #[test]
+    fn a_local2_base_without_models_is_refused() {
+        let err = providers_from_config(Config {
+            local2_base: Some(LOCAL2_BASE.into()),
+            local2_models: Some(" , ".into()),
+            ..Config::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LOCAL2_BASE_ENV), "{err}");
+        assert!(err.contains(LOCAL2_MODELS_ENV), "{err}");
+    }
+
+    #[test]
+    fn local2_models_without_a_base_are_refused() {
+        let err = providers_from_config(Config {
+            local2_models: Some("gpt-oss-20b".into()),
+            ..Config::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LOCAL2_BASE_ENV), "{err}");
+        assert!(err.contains(LOCAL2_MODELS_ENV), "{err}");
+    }
+
+    #[test]
+    fn local2_alone_serves_its_models() {
+        let providers = providers_from_config(Config {
+            local2_base: Some(LOCAL2_BASE.into()),
+            local2_models: Some("gpt-oss-20b".into()),
+            cloud_models: String::new(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, LOCAL2_NAME);
+        let models = models(providers, None);
+        assert_eq!(models.active(), "local2:gpt-oss-20b");
+        assert_eq!(models.view()["profiles"][0]["server"], LOCAL_NAME);
     }
 
     #[test]

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-09-01: **a run can leave named tools out.** `POST /runs` takes
+  `without_tools`, a list of tool names the model is not offered on that run.
+  geolang sends the agent tools its viewer catalogue supersedes, since a model
+  given both `terrain_profile` and `analysis.terrain_profile` took the tool
+  every time whatever the prompt said.
 - 2026-09-01: **a second local server from env.** `SIBYL_LOCAL2_API_BASE` and
   `SIBYL_LOCAL2_MODELS` seed a `local2` provider alongside `local`, with the
   same paired-or-neither check, trailing slash trim, missing `Authorization`

@@ -101,6 +101,10 @@ pub struct RunRequest {
     /// absent uses the active profile, and a pinned one never changes it.
     #[serde(default)]
     pub profile: Option<String>,
+    /// tools this run is not offered: geolang names the ones a viewer action
+    /// in the run's catalogue replaces
+    #[serde(default)]
+    pub without_tools: Vec<String>,
 }
 
 /// per-run ceilings, both operator-tunable. the wall clock one exists because a
@@ -376,6 +380,17 @@ where
     Ok(!turn.tool_calls.is_empty())
 }
 
+/// the manifest less the tools the request leaves out
+fn without(tools: Vec<Value>, left_out: &[String]) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|tool| {
+            let name = tool["function"]["name"].as_str().unwrap_or_default();
+            !left_out.iter().any(|hidden| hidden == name)
+        })
+        .collect()
+}
+
 /// the names the model was actually offered, so salvage can refuse anything else
 fn tool_names(tools: &[Value]) -> HashSet<&str> {
     tools
@@ -480,7 +495,7 @@ async fn agent_loop(
     sink: &EventSink,
 ) {
     let mut tools = match state.catalog.tools().await {
-        Ok(tools) => tools,
+        Ok(tools) => without(tools, &req.without_tools),
         Err(err) => return sink.fail(err).await,
     };
     tools.extend(crate::memory::tool_defs());
@@ -659,6 +674,32 @@ mod tests {
             serde_json::from_str(r#"{"system_prompt":"s","message":"m","thread_id":"sess-1"}"#)
                 .unwrap();
         assert_eq!(threaded.thread_id.as_deref(), Some("sess-1"));
+    }
+
+    /// geolang sends the agent tools its viewer catalogue supersedes
+    #[test]
+    fn a_run_request_can_leave_tools_out() {
+        let all: RunRequest =
+            serde_json::from_str(r#"{"system_prompt":"s","message":"m"}"#).unwrap();
+        assert!(all.without_tools.is_empty());
+
+        let fewer: RunRequest = serde_json::from_str(
+            r#"{"system_prompt":"s","message":"m","without_tools":["terrain_profile"]}"#,
+        )
+        .unwrap();
+        assert_eq!(fewer.without_tools, vec!["terrain_profile".to_string()]);
+    }
+
+    #[test]
+    fn a_left_out_tool_is_not_offered() {
+        let tools = vec![
+            json!({"type": "function", "function": {"name": "terrain_profile"}}),
+            json!({"type": "function", "function": {"name": "geocode_place"}}),
+        ];
+
+        let offered = without(tools, &["terrain_profile".to_string()]);
+
+        assert_eq!(tool_names(&offered), HashSet::from(["geocode_place"]));
     }
 
     /// only a caller looking at a map sends one

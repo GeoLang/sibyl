@@ -31,7 +31,7 @@ An empty value counts as unset and falls back to the default, so a compose `${VA
 
 `PLATFORM_JWT_SECRET` is the shared HS256 secret the rest of the platform validates with, over `{sub, exp}` and no `aud`. The verified `sub` owns every session that caller creates: `GET /sessions` lists only theirs, the active session is theirs alone, and naming someone else's session id on any route answers 404 rather than 403, so ids cannot be probed.
 
-Only a plain platform bearer counts. A token carrying `token_use` or `geolang_use` is refused: geolang mints those for its own tool boundary and its `/mcp` door, and the tool ones are held by the executor that runs caller-written code.
+Only a plain platform bearer counts. A token carrying `token_use`, `geolang_use` or `agora_use` is refused: geolang mints the first two for its own tool boundary and its `/mcp` door, the tool ones are held by the executor that runs caller-written code, and agora mints a long lived feed token signed with the same secret.
 
 Starting without the secret takes `SIBYL_ALLOW_UNAUTHENTICATED=1`, which logs one line at startup and leaves every session unowned and reachable by anyone who can reach the port. That is the standalone stack and the eval harness, neither of which holds a token.
 
@@ -45,7 +45,7 @@ sibyl builds one profile per model on any number of named providers and you swit
 - **local**, one profile per entry of `SIBYL_LOCAL_MODELS`, calling `SIBYL_LOCAL_API_BASE` with no key.
 - **local2**, the same for `SIBYL_LOCAL2_MODELS` and `SIBYL_LOCAL2_API_BASE`, for a second local server.
 
-Settings can add more of either kind (`PUT /model/providers`): another cloud API with its own base and key, or another local llama-server with its own base and model list. `DELETE /model/providers/{id}` removes one. The list is stored in sqlite and overrides env on the next start.
+Settings can add more of either kind (`PUT /model/providers`): another cloud API with its own base and key, or another local llama-server with its own base and model list. `DELETE /model/providers/{id}` removes one. Both routes need a platform bearer when the gate is on, the same as `PUT /model/cloud`. The list is stored in sqlite and overrides env on the next start.
 
 A profile id is `<provider>:<model>`, so `local:Qwen3.5-9B-Q4_K_M`, `local2:gpt-oss-20b` and `cloud:grok-4-1-fast-reasoning`, and its label is `<model> (<provider>)`. `GET /models` lists the local profiles first, then the cloud ones, and includes `cloud.base`, `cloud.models` and `cloud.has_key` so the viewer can show the current cloud server without echoing the key. Local profiles also carry `reachable`, from a short `GET {base}/models` probe, so a turned-off host is greyed out rather than looking live. A run on a local profile whose host is down fails with a message and keeps that profile active: sibyl never switches to a cloud API on its own.
 
@@ -181,9 +181,12 @@ For a dedicated always-on server on the remote box instead (a second loaded mode
 - `PATCH /sessions/{id}` `{"name"}` renames
 - `DELETE /sessions/{id}` deletes, 400 if active
 - `POST /sessions/{id}/messages` `{"content"}` appends a user message without running the model
-- `GET /models` `{"active", "profiles":[{"id","label","model","server","available"}]}`, local profiles first
+- `GET /models` `{"active", "profiles":[{"id","label","model","server","provider","available","reachable"}], "providers":[{"id","label","server","base","models","has_key","reachable"}], "cloud":{"id","base","models","has_key"}}`, local profiles first
 - `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable
-- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?,"document"?,"profile"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the caller's own active session is used, and one is created when they have none. A `thread_id` naming someone else's session ends the stream with an `error` event. `user_token` is the caller's bearer token: it names the session owner, and it is sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. `document` is the agora document the asker is looking at, sent as `X-Agora-Document` on every tool call of the run so a tool can read that map. `profile` pins this one run to an exact profile id, `local:Qwen3.5-35B-A3B` and the like, as `GET /models` lists them: that profile's client answers the run, and the active profile is neither read nor changed. An id that is unknown or has no client is a 400 naming it. Absent, the run uses the active profile as before.
+- `PUT /model/cloud` `{"base"?,"key"?,"models"?}` rewrites the cloud provider and switches to its first profile, 204, 400 for an empty key
+- `PUT /model/providers` `{"id"?,"label"?,"server"?,"base"?,"key"?,"models"?}` adds or updates one provider, 204
+- `DELETE /model/providers/{id}` removes one provider, 204
+- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?,"document"?,"profile"?,"without_tools"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the caller's own active session is used, and one is created when they have none. A `thread_id` naming someone else's session ends the stream with an `error` event. `user_token` is the caller's bearer token: it names the session owner, and it is sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. `document` is the agora document the asker is looking at, sent as `X-Agora-Document` on every tool call of the run so a tool can read that map. `profile` pins this one run to an exact profile id, `local:Qwen3.5-35B-A3B` and the like, as `GET /models` lists them: that profile's client answers the run, and the active profile is neither read nor changed. An id that is unknown or has no client is a 400 naming it. Absent, the run uses the active profile as before. `without_tools` names manifest tools the model is not offered on this run, which is how geolang keeps a model from reaching for an older tool its viewer catalogue replaces. The two memory tools below are added after the filter, so they cannot be left out.
 
 Every `/sessions` route reads the bearer from the `Authorization` header, and `/runs` reads the same token from `user_token`. With `PLATFORM_JWT_SECRET` set, a missing or invalid one is a 401 with `{"error": ...}`. Without the secret nothing is checked and the tools call services unauthenticated.
 
@@ -191,8 +194,14 @@ Every `/sessions` route reads the bearer from the `Authorization` header, and `/
 
 A switch applies to the next run. A run already going finishes on the profile it started with.
 
-Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`. A run that hits `SIBYL_MAX_MODEL_CALLS` or `SIBYL_RUN_BUDGET_SECS` ends with an `error` event naming which one it was.
+Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`. A run that hits `SIBYL_MAX_MODEL_CALLS` or `SIBYL_RUN_BUDGET_SECS` ends with an `error` event naming which one it was. So does a tool called three times in a row with the same arguments and the same result, whether it succeeded or failed. When a run ends on an error, sibyl appends an assistant message `I could not finish: <error>` to the session, so the next prompt reads the earlier request as closed rather than finishing it unasked.
 
 Dropping the NDJSON connection cancels the run. sibyl requests completions with `stream: true` and accumulates them server side, so a dropped run also drops the in-flight request and the model server stops generating instead of finishing an answer nobody is waiting for. The loop checks for a departed client before each model call too, in case the disconnect lands between calls. The event shape is unchanged either way, sibyl does not forward partial tokens.
 
 The tool manifest comes from `GET {GEOLANG_URL}/tools` and is cached for 60 seconds, tool calls go to `POST {GEOLANG_URL}/tools/{name}` with `{"args": {...}}` and read back `.result`.
+
+## Session memory
+
+Beside the manifest, sibyl offers two tools of its own and runs them itself rather than sending them to the executor. `save_memory` stores one short fact against the session, `forget_memory` deletes the stored facts containing a given string. Up to 50 of a session's facts are appended to the system prompt on every later turn of that session, so recall costs no tool call. Facts do not cross sessions.
+
+The rest of the context is trimmed for you. Once a request is estimated over 100000 tokens, the last 20 messages stay verbatim and everything older goes to the run's own model to be summarized into one line of the system prompt, which is stored on the session so it is not summarized again. A summarization that fails drops the oldest messages for that request only. A tool result over 20000 characters is cut there and ends with `[truncated]`, in the `tool_return` event as well as in the history.

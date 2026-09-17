@@ -139,7 +139,7 @@ SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_
 
 ### Model on another machine (shared with liquid)
 
-To serve the model from a remote box that also runs [liquid](https://github.com/boxerab/liquid), share liquid's own managed server instead of loading a second model. Two pieces:
+To serve the model from a remote box that also runs liquid, which manages a llama-server of its own, share that server instead of loading a second model. Two pieces:
 
 1. On the remote machine, pin liquid's inference port in `~/.config/liquid/liquid.toml` so it stops picking a random one:
 
@@ -190,7 +190,7 @@ For a dedicated always-on server on the remote box instead (a second loaded mode
 
 Every `/sessions` route reads the bearer from the `Authorization` header, and `/runs` reads the same token from `user_token`. With `PLATFORM_JWT_SECRET` set, a missing or invalid one is a 401 with `{"error": ...}`. Without the secret nothing is checked and the tools call services unauthenticated.
 
-`/models`, `/model` and `/health` carry no gate: put sibyl behind something that authenticates if the model switch matters.
+`GET /models`, `PUT /model` and `GET /health` carry no gate: put sibyl behind something that authenticates if switching the active profile matters.
 
 A switch applies to the next run. A run already going finishes on the profile it started with.
 

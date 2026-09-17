@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-09-16: two README corrections. The API section said `/models`, `/model`
+  and `/health` carry no gate, which reads as the whole `/model` family:
+  `PUT /model/cloud`, `PUT /model/providers` and `DELETE /model/providers/{id}`
+  all check a platform bearer, and only `GET /models`, `PUT /model` and
+  `GET /health` do not. The liquid link pointed at a repository that answers
+  404, so it is now plain text.
+
 ### Added
 
 - 2026-09-01: **a run can leave named tools out.** `POST /runs` takes

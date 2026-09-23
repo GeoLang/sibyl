@@ -2,6 +2,8 @@
 
 Generic LLM agent loop as a microservice: it calls an OpenAI-compatible chat completions endpoint, dispatches tool calls over HTTP to an external executor, stores session history in sqlite, and streams run events as NDJSON.
 
+In the GeoLang platform the executor is [geolang](https://github.com/GeoLang/geolang). geolang serves the tool manifest at `GET /tools`, runs each call at `POST /tools/{name}`, and starts runs here from its `/chat/agui` route with the system prompt and the caller's token.
+
 ## Env
 
 | var | default | notes |
@@ -31,11 +33,11 @@ An empty value counts as unset and falls back to the default, so a compose `${VA
 
 `PLATFORM_JWT_SECRET` is the shared HS256 secret the rest of the platform validates with, over `{sub, exp}` and no `aud`. The verified `sub` owns every session that caller creates: `GET /sessions` lists only theirs, the active session is theirs alone, and naming someone else's session id on any route answers 404 rather than 403, so ids cannot be probed.
 
-Only a plain platform bearer counts. A token carrying `token_use`, `geolang_use` or `agora_use` is refused: geolang mints the first two for its own tool boundary and its `/mcp` door, the tool ones are held by the executor that runs caller-written code, and agora mints a long lived feed token signed with the same secret.
+Only a plain platform bearer counts. A token carrying `token_use`, `geolang_use` or `agora_use` is refused. geolang mints the first two for its tool calls and its `/mcp` route, and agora mints sensor feed tokens with the third, all signed with the same secret.
 
-Starting without the secret takes `SIBYL_ALLOW_UNAUTHENTICATED=1`, which logs one line at startup and leaves every session unowned and reachable by anyone who can reach the port. That is the standalone stack and the eval harness, neither of which holds a token.
+Starting without the secret takes `SIBYL_ALLOW_UNAUTHENTICATED=1`, which logs one line at startup and leaves every session unowned and reachable by anyone who can reach the port. Use it only on a local stack where nothing issues platform tokens.
 
-Sessions written before sibyl had owners carry no subject, so no authenticated caller can reach them. They are still there for an unauthenticated start.
+A session with no subject, such as one created while the gate was off, is out of reach of every authenticated caller. An unauthenticated start still sees it.
 
 ### Model profiles
 
@@ -53,16 +55,22 @@ Without `SIBYL_CLOUD_API_KEY` the cloud profiles are still listed and marked una
 
 The first local profile is active by default, the first cloud one when there is no local server. That choice is stored in sqlite and survives a restart. A stored id naming a profile that is now unavailable or no longer configured, say the key was pulled or the model left the list, falls back to the default rather than starting broken.
 
-`PUT /model` switches the active profile. `PUT /model/cloud` rewrites the cloud base, key and model list (`{"base","key","models"}`, each optional) and switches to the first new cloud profile. A missing field keeps the current value; an empty key is 400. The new values are stored in sqlite and override env on the next start. The route needs a platform bearer when the gate is on, because the published port would otherwise take a key from anyone who can reach it.
+`PUT /model` switches the active profile. `PUT /model/cloud` rewrites the cloud base, key and model list (`{"base","key","models"}`, each optional) and switches to the first new cloud profile. A missing field keeps the current value, and an empty key is 400. The new values are stored in sqlite and override env on the next start. The route needs a platform bearer when the gate is on, because the published port would otherwise take a key from anyone who can reach it.
 
 The key only ever goes to `SIBYL_CLOUD_API_BASE`. Local profiles send no `Authorization` header and log one line per local server at startup saying so, so point `SIBYL_LOCAL_API_BASE` and `SIBYL_LOCAL2_API_BASE` at servers you trust on a network you trust. The viewer never sees the key: `GET /models` has `has_key` and no `key` field.
 
 ## Run
 
 ```
-SIBYL_CLOUD_API_KEY=... SIBYL_DB_PATH=./sibyl.db cargo run
-docker build -t sibyl . && docker run -p 8090:8090 -e SIBYL_CLOUD_API_KEY=... -v sibyl-data:/data sibyl
+SIBYL_ALLOW_UNAUTHENTICATED=1 SIBYL_CLOUD_API_KEY=... SIBYL_DB_PATH=./sibyl.db cargo run
 ```
+
+```
+docker build -t sibyl .
+docker run -p 8090:8090 -e PLATFORM_JWT_SECRET=... -e SIBYL_CLOUD_API_KEY=... -v sibyl-data:/data sibyl
+```
+
+Startup fails unless `PLATFORM_JWT_SECRET` or `SIBYL_ALLOW_UNAUTHENTICATED=1` is set.
 
 ## Local model
 
@@ -80,7 +88,7 @@ Then point sibyl at it and leave `SIBYL_CLOUD_API_KEY` unset:
 
 ```
 SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M \
-  SIBYL_DB_PATH=./sibyl.db cargo run
+  SIBYL_ALLOW_UNAUTHENTICATED=1 SIBYL_DB_PATH=./sibyl.db cargo run
 ```
 
 Notes on the llama-server side:
@@ -108,7 +116,7 @@ The router names each model after its GGUF filename with the `.gguf` dropped, an
 ```
 SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 \
   SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M,Qwen3.8-27B-Q4_K_M \
-  SIBYL_DB_PATH=./sibyl.db cargo run
+  SIBYL_ALLOW_UNAUTHENTICATED=1 SIBYL_DB_PATH=./sibyl.db cargo run
 ```
 
 Qwen 3.8 ships a 27B and no 9B, so the small model stays Qwen 3.5: `Qwen3.8-27B-Q4_K_M.gguf` is the bartowski Q4_K_M file (about 18 GB), and the 9B is the `Qwen3.5-9B-Q4_K_M.gguf` the liquid runtime already holds.
@@ -134,7 +142,7 @@ Both env pairs are seeds only. Once a provider list is stored in sqlite, by the 
 ```
 SIBYL_LOCAL_API_BASE=http://127.0.0.1:18099/v1 SIBYL_LOCAL_MODELS=Qwen3.5-9B-Q4_K_M \
   SIBYL_LOCAL2_API_BASE=http://host.docker.internal:18200/v1 SIBYL_LOCAL2_MODELS=Qwen3.5-35B-A3B \
-  SIBYL_DB_PATH=./sibyl.db cargo run
+  SIBYL_ALLOW_UNAUTHENTICATED=1 SIBYL_DB_PATH=./sibyl.db cargo run
 ```
 
 ### Model on another machine (shared with liquid)
@@ -182,11 +190,11 @@ For a dedicated always-on server on the remote box instead (a second loaded mode
 - `DELETE /sessions/{id}` deletes, 400 if active
 - `POST /sessions/{id}/messages` `{"content"}` appends a user message without running the model
 - `GET /models` `{"active", "profiles":[{"id","label","model","server","provider","available","reachable"}], "providers":[{"id","label","server","base","models","has_key","reachable"}], "cloud":{"id","base","models","has_key"}}`, local profiles first
-- `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable
+- `PUT /model` `{"id"}` switches profile, 204 on success, 404 for an unknown id, 409 when that profile is unavailable or its local server does not answer the probe
 - `PUT /model/cloud` `{"base"?,"key"?,"models"?}` rewrites the cloud provider and switches to its first profile, 204, 400 for an empty key
 - `PUT /model/providers` `{"id"?,"label"?,"server"?,"base"?,"key"?,"models"?}` adds or updates one provider, 204
 - `DELETE /model/providers/{id}` removes one provider, 204
-- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?,"document"?,"profile"?,"without_tools"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (AG-UI thread); when it is absent the caller's own active session is used, and one is created when they have none. A `thread_id` naming someone else's session ends the stream with an `error` event. `user_token` is the caller's bearer token: it names the session owner, and it is sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. `document` is the agora document the asker is looking at, sent as `X-Agora-Document` on every tool call of the run so a tool can read that map. `profile` pins this one run to an exact profile id, `local:Qwen3.5-35B-A3B` and the like, as `GET /models` lists them: that profile's client answers the run, and the active profile is neither read nor changed. An id that is unknown or has no client is a 400 naming it. Absent, the run uses the active profile as before. `without_tools` names manifest tools the model is not offered on this run, which is how geolang keeps a model from reaching for an older tool its viewer catalogue replaces. The two memory tools below are added after the filter, so they cannot be left out.
+- `POST /runs` `{"system_prompt","message","user_token"?,"thread_id"?,"document"?,"profile"?,"without_tools"?}` runs the agent loop, NDJSON stream. `thread_id` is the session id (the AG-UI thread). A `thread_id` no session has yet creates one owned by the caller, and one naming someone else's session ends the stream with an `error` event. Without it the caller's own active session is used, and one is created when they have none. Two runs on the same session run one after the other. `user_token` is the caller's bearer token: it names the session owner, and it is sent as `Authorization: Bearer` on every tool call of that run and kept in memory only. `document` is the agora document the asker is looking at, sent as `X-Agora-Document` on every tool call of the run so a tool can read that map. `profile` pins this one run to an exact profile id, `local:Qwen3.5-35B-A3B` and the like, as `GET /models` lists them: that profile's client answers the run, and the active profile is neither read nor changed. An id that is unknown or has no client is a 400 naming it. Without `profile` the run uses the active profile. `without_tools` names manifest tools the model is not offered on this run, which is how geolang leaves out a tool that an action in the viewer's catalogue replaces. The two memory tools below are added after the filter, so they cannot be left out.
 
 Every `/sessions` route reads the bearer from the `Authorization` header, and `/runs` reads the same token from `user_token`. With `PLATFORM_JWT_SECRET` set, a missing or invalid one is a 401 with `{"error": ...}`. Without the secret nothing is checked and the tools call services unauthenticated.
 

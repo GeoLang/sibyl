@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- 2026-09-23: **provider settings need the admin role.** `PUT /model/cloud`,
+  `PUT /model/providers` and `DELETE /model/providers/{id}` accepted any
+  platform user, so a viewer could point the shared cloud provider at their
+  own host and receive the stored key and every user's chat with the next run.
+  They now answer 403 to anything but an `admin` bearer, and moving a
+  provider to a new base drops its stored key.
+
 ### Changed
 
 - 2026-09-16: two README corrections. The API section said `/models`, `/model`

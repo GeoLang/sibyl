@@ -20,6 +20,8 @@ use serde_json::json;
 pub const SECRET_ENV: &str = "PLATFORM_JWT_SECRET";
 pub const UNAUTHENTICATED_ENV: &str = "SIBYL_ALLOW_UNAUTHENTICATED";
 
+const ADMIN_ROLE: &str = "admin";
+
 const TRUTHY: [&str; 4] = ["1", "true", "yes", "on"];
 
 pub fn truthy(value: Option<String>) -> bool {
@@ -37,12 +39,15 @@ struct TokenClaims {
     geolang_use: Option<String>,
     #[serde(default)]
     agora_use: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AuthError {
     Missing,
     Invalid,
+    NotAdmin,
 }
 
 impl std::fmt::Display for AuthError {
@@ -52,17 +57,18 @@ impl std::fmt::Display for AuthError {
             // signature" helps an attacker more than a caller
             Self::Missing => f.write_str("missing bearer token"),
             Self::Invalid => f.write_str("invalid or expired token"),
+            Self::NotAdmin => f.write_str("this needs the admin role"),
         }
     }
 }
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": self.to_string() })),
-        )
-            .into_response()
+        let status = match self {
+            Self::Missing | Self::Invalid => StatusCode::UNAUTHORIZED,
+            Self::NotAdmin => StatusCode::FORBIDDEN,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
 }
 
@@ -105,21 +111,35 @@ impl Auth {
             Self::Unauthenticated => return Ok(None),
             Self::Platform(key) => key,
         };
-        let token = token.ok_or(AuthError::Missing)?;
-        let claims = decode::<TokenClaims>(token, key, &Validation::default())
-            .map_err(|_| AuthError::Invalid)?
-            .claims;
-        if claims.sub.is_empty() {
-            return Err(AuthError::Invalid);
-        }
-        // a token minted for another service's door is not a session bearer,
-        // and the executor holds the tool ones
-        if claims.token_use.is_some() || claims.geolang_use.is_some() || claims.agora_use.is_some()
-        {
-            return Err(AuthError::Invalid);
-        }
-        Ok(Some(claims.sub))
+        Ok(Some(verified_claims(key, token)?.sub))
     }
+
+    pub fn require_admin(&self, token: Option<&str>) -> Result<(), AuthError> {
+        let key = match self {
+            Self::Unauthenticated => return Ok(()),
+            Self::Platform(key) => key,
+        };
+        if verified_claims(key, token)?.role.as_deref() != Some(ADMIN_ROLE) {
+            return Err(AuthError::NotAdmin);
+        }
+        Ok(())
+    }
+}
+
+fn verified_claims(key: &DecodingKey, token: Option<&str>) -> Result<TokenClaims, AuthError> {
+    let token = token.ok_or(AuthError::Missing)?;
+    let claims = decode::<TokenClaims>(token, key, &Validation::default())
+        .map_err(|_| AuthError::Invalid)?
+        .claims;
+    if claims.sub.is_empty() {
+        return Err(AuthError::Invalid);
+    }
+    // a token minted for another service's door is not a session bearer,
+    // and the executor holds the tool ones
+    if claims.token_use.is_some() || claims.geolang_use.is_some() || claims.agora_use.is_some() {
+        return Err(AuthError::Invalid);
+    }
+    Ok(claims)
 }
 
 pub fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -146,6 +166,10 @@ pub mod testing {
         signed(json!({ "sub": subject, "exp": exp, "role": "editor" }))
     }
 
+    pub fn admin_token_for(subject: &str) -> String {
+        signed(json!({ "sub": subject, "exp": 3_000_000_000i64, "role": "admin" }))
+    }
+
     pub fn signed(claims: serde_json::Value) -> String {
         encode(
             &Header::default(),
@@ -158,8 +182,30 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{SECRET, signed, token_expiring, token_for};
+    use super::testing::{SECRET, admin_token_for, signed, token_expiring, token_for};
     use super::*;
+
+    #[test]
+    fn only_an_admin_token_passes_the_admin_check() {
+        let auth = platform();
+        assert_eq!(auth.require_admin(Some(&admin_token_for("owner"))), Ok(()));
+        assert_eq!(
+            auth.require_admin(Some(&token_for("user-1"))),
+            Err(AuthError::NotAdmin)
+        );
+        assert_eq!(auth.require_admin(None), Err(AuthError::Missing));
+        let admin_tool = signed(json!({
+            "sub": "owner",
+            "exp": 3_000_000_000i64,
+            "role": "admin",
+            "token_use": "tool",
+        }));
+        assert_eq!(
+            auth.require_admin(Some(&admin_tool)),
+            Err(AuthError::Invalid)
+        );
+        assert_eq!(Auth::new(None, true).unwrap().require_admin(None), Ok(()));
+    }
 
     fn platform() -> Auth {
         Auth::new(Some(SECRET.into()), false).unwrap()

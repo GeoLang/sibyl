@@ -662,10 +662,13 @@ impl Models {
             }
             None => None,
         };
+        // a stored key only goes back to the host it was saved for
+        let kept_key = existing
+            .as_ref()
+            .filter(|provider| provider.base == base)
+            .and_then(|provider| provider.key.clone());
         let key = if server.needs_key() {
-            provided_key
-                .clone()
-                .or_else(|| existing.as_ref().and_then(|provider| provider.key.clone()))
+            provided_key.clone().or(kept_key)
         } else {
             None
         };
@@ -863,8 +866,9 @@ pub struct Upserted {
     pub key: Option<String>,
 }
 
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), auth::AuthError> {
-    state.auth.subject(auth::bearer(headers)).map(|_| ())
+// providers are shared by every user and hold the keys
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), auth::AuthError> {
+    state.auth.require_admin(auth::bearer(headers))
 }
 
 fn persist_state(state: &AppState) -> Result<(), ApiError> {
@@ -889,7 +893,7 @@ pub async fn configure(
     headers: HeaderMap,
     Json(payload): Json<CloudPayload>,
 ) -> Response {
-    if let Err(err) = require_auth(&state, &headers) {
+    if let Err(err) = require_admin(&state, &headers) {
         return err.into_response();
     }
     if let Err(err) = state.models.configure_cloud(CloudUpdate {
@@ -910,7 +914,7 @@ pub async fn upsert(
     headers: HeaderMap,
     Json(payload): Json<ProviderPayload>,
 ) -> Response {
-    if let Err(err) = require_auth(&state, &headers) {
+    if let Err(err) = require_admin(&state, &headers) {
         return err.into_response();
     }
     let server = match payload.server.as_deref() {
@@ -947,7 +951,7 @@ pub async fn remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(err) = require_auth(&state, &headers) {
+    if let Err(err) = require_admin(&state, &headers) {
         return err.into_response();
     }
     if let Err(err) = state.models.remove_provider(&id) {
@@ -1229,6 +1233,27 @@ mod tests {
         let body = serde_json::to_string(&view).unwrap();
         assert!(!body.contains("sk-ant"), "{body}");
         assert!(!body.contains(KEY), "{body}");
+    }
+
+    #[test]
+    fn a_stored_key_is_dropped_when_the_base_moves() {
+        let models = models(cloud_only(), None);
+        let rename = |base: Option<&str>| ProviderUpdate {
+            id: Some(CLOUD_NAME.into()),
+            label: Some("renamed".into()),
+            server: None,
+            base: base.map(str::to_string),
+            key: None,
+            models: None,
+        };
+        models.upsert_provider(rename(None)).unwrap();
+        assert!(models.stored_json().unwrap().contains(KEY));
+
+        models
+            .upsert_provider(rename(Some("https://attacker.example/v1")))
+            .unwrap();
+        assert!(!models.stored_json().unwrap().contains(KEY));
+        assert!(models.client_for(CLOUD_ID).is_none());
     }
 
     #[test]
@@ -1557,8 +1582,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn upserting_without_a_bearer_is_401_when_gated() {
-            use crate::auth::testing::{SECRET, token_for};
+        async fn upserting_needs_an_admin_bearer_when_gated() {
+            use crate::auth::testing::{SECRET, admin_token_for, token_for};
             use axum::body::Body;
             use axum::http::Request;
             use tower::ServiceExt;
@@ -1587,19 +1612,21 @@ mod tests {
                 .unwrap();
             assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
-            let authed = app
-                .oneshot(
+            let put_as = |token: String| {
+                app.clone().oneshot(
                     Request::builder()
                         .method("PUT")
                         .uri("/model/providers")
                         .header("content-type", "application/json")
-                        .header("authorization", format!("Bearer {}", token_for("alice")))
+                        .header("authorization", format!("Bearer {token}"))
                         .body(Body::from(body))
                         .unwrap(),
                 )
-                .await
-                .unwrap();
-            assert_eq!(authed.status(), StatusCode::NO_CONTENT);
+            };
+            let editor = put_as(token_for("alice")).await.unwrap();
+            assert_eq!(editor.status(), StatusCode::FORBIDDEN);
+            let admin = put_as(admin_token_for("owner")).await.unwrap();
+            assert_eq!(admin.status(), StatusCode::NO_CONTENT);
         }
     }
 }

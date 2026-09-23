@@ -25,6 +25,8 @@ In the GeoLang platform the executor is [geolang](https://github.com/GeoLang/geo
 | `SIBYL_MAX_MODEL_CALLS` | `30` | model calls per run |
 | `SIBYL_RUN_BUDGET_SECS` | `900` | wall clock per run |
 | `SIBYL_MAX_TOKENS` | unset | `max_tokens` per request, mainly for thinking models on small context windows, which otherwise think until the context runs out |
+| `SIBYL_MONTHLY_SPEND_LIMIT_USD` | unset | model calls are refused once this many dollars are spent in a UTC month, counted in `SIBYL_DB_PATH`. Needs `SIBYL_MODEL_PRICES` |
+| `SIBYL_MODEL_PRICES` | unset | `model=input/output` in USD per million tokens, comma separated, e.g. `openai.gpt-oss-120b=0.15/0.60`. With the limit set, a model missing here is refused |
 | `SIBYL_THINKING` | unset | `1`/`true` asks the local llama-server for thinking per request (`chat_template_kwargs`) with qwen's thinking sampling, overriding its startup `--reasoning off`. Local profiles only, cloud requests are untouched |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank a base URL or a model list.

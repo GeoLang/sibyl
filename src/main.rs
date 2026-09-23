@@ -6,6 +6,7 @@ mod models;
 mod run;
 mod salvage;
 mod sessions;
+mod spend;
 mod tools;
 
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ use crate::auth::Auth;
 use crate::db::Db;
 use crate::models::{ACTIVE_KEY, Models};
 use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
+use crate::spend::SpendCap;
 use crate::tools::ToolCatalog;
 
 #[derive(Clone)]
@@ -115,7 +117,18 @@ async fn main() -> Result<()> {
     let host = env_or("SIBYL_HOST", "0.0.0.0");
     let port: u16 = env_parsed("SIBYL_PORT", 8090)?;
     let db_path = PathBuf::from(env_or("SIBYL_DB_PATH", "/data/sibyl.db"));
-    let db = Db::open(&db_path)?;
+    let db = Arc::new(Db::open(&db_path)?);
+    let spend_cap = SpendCap::from_env(
+        db.clone(),
+        env_var(spend::LIMIT_ENV),
+        env_var(spend::PRICES_ENV),
+    )?;
+    if spend_cap.is_some() {
+        info!(
+            "model calls stop once {} is spent in a month",
+            spend::LIMIT_ENV
+        );
+    }
     let model_config = models::Config {
         cloud_key: env_var(models::CLOUD_KEY_ENV),
         cloud_base: env_or(models::CLOUD_BASE_ENV, models::DEFAULT_CLOUD_API_BASE),
@@ -167,10 +180,11 @@ async fn main() -> Result<()> {
         db.get_config(ACTIVE_KEY)?,
         max_tokens,
         thinking,
+        spend_cap,
     );
     let active = models.active_label();
     let state = AppState {
-        db: Arc::new(db),
+        db,
         models: Arc::new(models),
         catalog: Arc::new(ToolCatalog::new(
             http,
@@ -233,7 +247,7 @@ pub mod testing {
         .expect("cloud profile from a key");
         AppState {
             db,
-            models: Arc::new(Models::new(&http, providers, None, None, false)),
+            models: Arc::new(Models::new(&http, providers, None, None, false, None)),
             catalog: Arc::new(ToolCatalog::new(
                 http,
                 "http://127.0.0.1:1".into(),

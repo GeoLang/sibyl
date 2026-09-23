@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-09-23: **monthly model spend cap.** With `SIBYL_MONTHLY_SPEND_LIMIT_USD`
+  and `SIBYL_MODEL_PRICES` set, every model call asks for
+  `stream_options.include_usage`, charges its input estimate before the call
+  and the reported cost after it, and is refused with "The model budget for
+  this month is used up" once the UTC month's total reaches the limit. The
+  total is a `model_spend` row in sibyl.db, so a restart keeps it.
 - 2026-09-01: **a run can leave named tools out.** `POST /runs` takes
   `without_tools`, a list of tool names the model is not offered on that run.
   geolang sends the agent tools its viewer catalogue supersedes, since a model

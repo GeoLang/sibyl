@@ -116,6 +116,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS model_spend (
+                month TEXT PRIMARY KEY,
+                usd REAL NOT NULL
             );",
         )?;
         migrate_sessions(&conn)?;
@@ -348,6 +352,27 @@ impl Db {
             "INSERT INTO config (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn month_spend(&self, month: &str) -> Result<f64> {
+        let usd = self
+            .conn()
+            .query_row(
+                "SELECT usd FROM model_spend WHERE month = ?1",
+                params![month],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(usd.unwrap_or(0.0))
+    }
+
+    pub fn add_spend(&self, month: &str, usd: f64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO model_spend (month, usd) VALUES (?1, ?2)
+             ON CONFLICT(month) DO UPDATE SET usd = usd + excluded.usd",
+            params![month, usd],
         )?;
         Ok(())
     }

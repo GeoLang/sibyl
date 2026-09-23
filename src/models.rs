@@ -19,6 +19,7 @@ use crate::auth;
 use crate::db::Db;
 use crate::llm::Client;
 use crate::sessions::ApiError;
+use crate::spend::SpendCap;
 
 pub const CLOUD_KEY_ENV: &str = "SIBYL_CLOUD_API_KEY";
 pub const CLOUD_BASE_ENV: &str = "SIBYL_CLOUD_API_BASE";
@@ -305,7 +306,13 @@ pub struct Profile {
 }
 
 impl Profile {
-    fn new(spec: Spec, http: &reqwest::Client, max_tokens: Option<u32>, thinking: bool) -> Self {
+    fn new(
+        spec: Spec,
+        http: &reqwest::Client,
+        max_tokens: Option<u32>,
+        thinking: bool,
+        spend_cap: Option<Arc<SpendCap>>,
+    ) -> Self {
         let available = spec.available();
         let Spec {
             provider,
@@ -325,6 +332,7 @@ impl Profile {
                 model.clone(),
                 max_tokens,
                 thinking && server.takes_thinking(),
+                spend_cap,
             ))
         });
         Self {
@@ -376,6 +384,7 @@ pub struct Models {
     http: reqwest::Client,
     max_tokens: Option<u32>,
     thinking: bool,
+    spend_cap: Option<Arc<SpendCap>>,
     inner: Mutex<Inner>,
 }
 
@@ -386,8 +395,9 @@ impl Models {
         stored: Option<String>,
         max_tokens: Option<u32>,
         thinking: bool,
+        spend_cap: Option<Arc<SpendCap>>,
     ) -> Self {
-        let profiles = profiles_from(http, &providers, max_tokens, thinking);
+        let profiles = profiles_from(http, &providers, max_tokens, thinking, &spend_cap);
         let fallback = fallback_id(&profiles);
         let active = stored
             .filter(|id| {
@@ -400,6 +410,7 @@ impl Models {
             http: http.clone(),
             max_tokens,
             thinking,
+            spend_cap,
             inner: Mutex::new(Inner {
                 providers,
                 profiles,
@@ -412,13 +423,14 @@ impl Models {
         self.inner.lock().expect("models mutex")
     }
 
-    fn rebuild_locked(
-        inner: &mut Inner,
-        http: &reqwest::Client,
-        max_tokens: Option<u32>,
-        thinking: bool,
-    ) {
-        inner.profiles = profiles_from(http, &inner.providers, max_tokens, thinking);
+    fn rebuild_locked(&self, inner: &mut Inner) {
+        inner.profiles = profiles_from(
+            &self.http,
+            &inner.providers,
+            self.max_tokens,
+            self.thinking,
+            &self.spend_cap,
+        );
         if !inner
             .profiles
             .iter()
@@ -692,7 +704,7 @@ impl Models {
                 .cloned()
                 .unwrap_or_default()
         );
-        Self::rebuild_locked(&mut inner, &self.http, self.max_tokens, self.thinking);
+        self.rebuild_locked(&mut inner);
         if inner
             .profiles
             .iter()
@@ -714,7 +726,7 @@ impl Models {
         if inner.providers.len() == before {
             return Err(CloudError::UnknownProvider);
         }
-        Self::rebuild_locked(&mut inner, &self.http, self.max_tokens, self.thinking);
+        self.rebuild_locked(&mut inner);
         Ok(())
     }
 
@@ -750,11 +762,12 @@ fn profiles_from(
     providers: &[Provider],
     max_tokens: Option<u32>,
     thinking: bool,
+    spend_cap: &Option<Arc<SpendCap>>,
 ) -> Vec<Profile> {
     providers
         .iter()
         .flat_map(Provider::to_specs)
-        .map(|spec| Profile::new(spec, http, max_tokens, thinking))
+        .map(|spec| Profile::new(spec, http, max_tokens, thinking, spend_cap.clone()))
         .collect()
 }
 
@@ -999,6 +1012,7 @@ mod tests {
             stored.map(str::to_string),
             None,
             false,
+            None,
         )
     }
 

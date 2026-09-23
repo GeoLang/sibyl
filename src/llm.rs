@@ -1,8 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
+
+use crate::spend::SpendCap;
+
+const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
@@ -64,7 +70,7 @@ impl ChatMessage {
                 bytes += call.id.len() + call.function.name.len() + call.function.arguments.len();
             }
         }
-        bytes / 4
+        bytes / ESTIMATED_BYTES_PER_TOKEN
     }
 }
 
@@ -83,6 +89,12 @@ pub struct Turn {
 const MAX_STREAM_TOOL_CALLS: usize = 64;
 const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     #[serde(default)]
@@ -90,6 +102,9 @@ struct StreamChunk {
     /// llama-server can report a failure mid-stream, after a 200
     #[serde(default)]
     error: Option<Value>,
+    // only on the last chunk, and only when the request asked for it
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +161,7 @@ pub struct StreamAccumulator {
     content: String,
     reasoning: String,
     calls: Vec<PartialCall>,
+    usage: Option<Usage>,
 }
 
 impl StreamAccumulator {
@@ -167,6 +183,9 @@ impl StreamAccumulator {
                 .and_then(Value::as_str)
                 .map_or_else(|| error.to_string(), str::to_string);
             bail!("model stream failed: {detail}");
+        }
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
         }
         for choice in chunk.choices {
             self.apply(choice.delta)?;
@@ -206,6 +225,10 @@ impl StreamAccumulator {
             }
         }
         Ok(())
+    }
+
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
     }
 
     pub fn finish(self) -> Turn {
@@ -265,6 +288,7 @@ pub struct Client {
     /// `--reasoning off`. only ever set on a local profile: the cloud api
     /// does not know `chat_template_kwargs`.
     thinking: bool,
+    spend_cap: Option<Arc<SpendCap>>,
 }
 
 impl Client {
@@ -275,6 +299,7 @@ impl Client {
         model: String,
         max_tokens: Option<u32>,
         thinking: bool,
+        spend_cap: Option<Arc<SpendCap>>,
     ) -> Self {
         Self {
             http,
@@ -283,6 +308,7 @@ impl Client {
             model,
             max_tokens,
             thinking,
+            spend_cap,
         }
     }
 
@@ -295,6 +321,13 @@ impl Client {
     /// whole answer nobody is waiting for.
     pub async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<Turn> {
         let body = self.body(messages, tools);
+        let charge = match &self.spend_cap {
+            Some(cap) => {
+                let estimated_input_tokens = body.to_string().len() / ESTIMATED_BYTES_PER_TOKEN;
+                Some(cap.charge_estimate(&self.model, estimated_input_tokens as u64)?)
+            }
+            None => None,
+        };
         let mut request = self
             .http
             .post(format!("{}/chat/completions", self.api_base))
@@ -306,7 +339,11 @@ impl Client {
             Ok(response) => response,
             Err(err) => bail!("{}", explain_transport(&err, self.api_key.is_none())),
         };
-        self.stream_turn(response).await
+        let (turn, usage) = self.stream_turn(response).await?;
+        if let (Some(cap), Some(charge), Some(usage)) = (&self.spend_cap, charge, usage) {
+            cap.settle(&self.model, charge, usage)?;
+        }
+        Ok(turn)
     }
 
     fn body(&self, messages: &[ChatMessage], tools: &[Value]) -> Value {
@@ -321,6 +358,9 @@ impl Client {
         if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = max_tokens.into();
         }
+        if self.spend_cap.is_some() {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
         if self.thinking {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": true });
             body["temperature"] = THINKING_TEMP.into();
@@ -329,7 +369,7 @@ impl Client {
         body
     }
 
-    async fn stream_turn(&self, response: reqwest::Response) -> Result<Turn> {
+    async fn stream_turn(&self, response: reqwest::Response) -> Result<(Turn, Option<Usage>)> {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -348,11 +388,13 @@ impl Client {
                 let line: Vec<u8> = buffer.drain(..=end).collect();
                 // a full line is complete json, so lossy decoding cannot split a char
                 if !accumulator.push(&String::from_utf8_lossy(&line))? {
-                    return Ok(accumulator.finish());
+                    let usage = accumulator.usage();
+                    return Ok((accumulator.finish(), usage));
                 }
             }
         }
-        Ok(accumulator.finish())
+        let usage = accumulator.usage();
+        Ok((accumulator.finish(), usage))
     }
 }
 
@@ -368,7 +410,80 @@ mod tests {
             "qwen".into(),
             None,
             thinking,
+            None,
         )
+    }
+
+    fn capped_client(cap: Arc<SpendCap>) -> Client {
+        Client::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1".into(),
+            Some("key".into()),
+            crate::spend::testing::MODEL.into(),
+            None,
+            false,
+            Some(cap),
+        )
+    }
+
+    #[test]
+    fn a_capped_client_asks_for_usage_and_an_uncapped_one_does_not() {
+        let temp = crate::db::testing::TempDb::new();
+        let cap = crate::spend::testing::cap(Arc::new(temp.reopen()), 50.0);
+        let capped = capped_client(cap).body(&[ChatMessage::user("hi")], &[]);
+        assert_eq!(capped["stream_options"]["include_usage"], true);
+        let uncapped = client(false).body(&[ChatMessage::user("hi")], &[]);
+        assert!(uncapped.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_spent_month_refuses_before_the_model_is_called() {
+        let temp = crate::db::testing::TempDb::new();
+        let db = Arc::new(temp.reopen());
+        db.add_spend(crate::spend::testing::MONTH, 50.0).unwrap();
+        let err = capped_client(crate::spend::testing::cap(db, 50.0))
+            .chat(&[ChatMessage::user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), crate::spend::SPENT_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_never_reaches_the_model_still_pays_its_input_estimate() {
+        let temp = crate::db::testing::TempDb::new();
+        let db = Arc::new(temp.reopen());
+        let cap = crate::spend::testing::cap(db.clone(), 50.0);
+        let prompt = "x".repeat(4_000_000);
+        capped_client(cap)
+            .chat(&[ChatMessage::user(prompt)], &[])
+            .await
+            .unwrap_err();
+        let spent = db.month_spend(crate::spend::testing::MONTH).unwrap();
+        assert!(spent >= 0.15, "charged {spent}");
+    }
+
+    // bedrock's openai endpoint sends usage in its own chunk after finish_reason
+    #[test]
+    fn the_usage_chunk_before_done_is_kept() {
+        let mut accumulator = StreamAccumulator::default();
+        for line in [
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#,
+            r#"data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}],"usage":null}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":34,"total_tokens":1234}}"#,
+            "data: [DONE]",
+        ] {
+            if !accumulator.push(line).unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            accumulator.usage(),
+            Some(Usage {
+                prompt_tokens: 1200,
+                completion_tokens: 34,
+            })
+        );
+        assert_eq!(accumulator.finish().text.as_deref(), Some("hi"));
     }
 
     #[test]

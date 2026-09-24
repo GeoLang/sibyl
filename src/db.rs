@@ -7,6 +7,8 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+pub const MAX_LOADED_HISTORY_MESSAGES: usize = 200;
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Session {
     pub id: String,
@@ -320,20 +322,25 @@ impl Db {
     pub fn messages_after(&self, session_id: &str, watermark: i64) -> Result<Vec<StoredMessage>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, tool_calls, tool_call_id, name
-             FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
+            "SELECT id, role, content, tool_calls, tool_call_id, name FROM (
+                SELECT id, role, content, tool_calls, tool_call_id, name
+                FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT ?3
+             ) ORDER BY id",
         )?;
         let rows = stmt
-            .query_map(params![session_id, watermark], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    tool_calls: row.get(3)?,
-                    tool_call_id: row.get(4)?,
-                    name: row.get(5)?,
-                })
-            })?
+            .query_map(
+                params![session_id, watermark, MAX_LOADED_HISTORY_MESSAGES as i64],
+                |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        tool_calls: row.get(3)?,
+                        tool_call_id: row.get(4)?,
+                        name: row.get(5)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

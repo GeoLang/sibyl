@@ -11,6 +11,21 @@ use crate::db::{NewMessage, Session};
 
 pub struct ApiError(StatusCode, String);
 
+pub const MAX_USER_MESSAGE_BYTES: usize = 32 * 1024;
+
+pub fn ensure_message_fits(message: &str) -> Result<(), ApiError> {
+    if message.len() <= MAX_USER_MESSAGE_BYTES {
+        return Ok(());
+    }
+    Err(ApiError(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "message is {} bytes, the limit is {MAX_USER_MESSAGE_BYTES}",
+            message.len()
+        ),
+    ))
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
@@ -131,6 +146,7 @@ pub async fn add_message(
     if state.db.get_session(&id, subject.as_deref())?.is_none() {
         return Err(not_found());
     }
+    ensure_message_fits(&payload.content)?;
     state
         .db
         .append_message(&id, &NewMessage::user(payload.content))?;
@@ -282,6 +298,25 @@ mod tests {
             harness.db.messages_after(&mine.id, 0).unwrap().is_empty(),
             "a foreign message reached the session"
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_is_refused_and_not_stored() {
+        let harness = gated();
+        let mine = harness.db.create_session("mine", Some("alice")).unwrap();
+        let content = "x".repeat(super::MAX_USER_MESSAGE_BYTES + 1);
+
+        let (status, body) = harness
+            .send(request(
+                "POST",
+                &format!("/sessions/{}/messages", mine.id),
+                Some(&token_for("alice")),
+                Some(&serde_json::json!({ "content": content }).to_string()),
+            ))
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(harness.db.messages_after(&mine.id, 0).unwrap().is_empty());
     }
 
     #[tokio::test]

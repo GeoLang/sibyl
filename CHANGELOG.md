@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+- 2026-09-24: **chat messages and history have a size limit.** `POST /runs`
+  stored a `message` of up to 2 MB before any token check, and every model
+  call read the whole history after the summary. A `message` or a
+  `POST /sessions/{id}/messages` content over 32768 bytes is now a 400 and
+  nothing is stored. A model call reads at most the newest 200 messages after
+  the summary, and a request holding all 200 is summarized like one over
+  100000 tokens.
 - 2026-09-23: **each user picks their own model.** `PUT /model` took no
   bearer and switched the one active profile for every user, so anyone could
   move the whole deployment onto a slow or costly model. It now needs a

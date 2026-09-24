@@ -20,9 +20,9 @@ use tracing::warn;
 
 use crate::AppState;
 use crate::daily_limits::UserTokens;
-use crate::db::{Db, NewMessage, StoredMessage};
+use crate::db::{Db, MAX_LOADED_HISTORY_MESSAGES, NewMessage, StoredMessage};
 use crate::llm::{ChatMessage, Client, ToolCall, Turn, estimated_tokens};
-use crate::sessions::ApiError;
+use crate::sessions::{ApiError, ensure_message_fits};
 use crate::tools::UserToken;
 
 pub const DEFAULT_MAX_MODEL_CALLS: usize = 30;
@@ -287,7 +287,8 @@ where
         &history,
     );
 
-    if estimated_tokens(&messages) <= SUMMARIZE_THRESHOLD_TOKENS {
+    let window_full = history.len() >= MAX_LOADED_HISTORY_MESSAGES;
+    if !window_full && estimated_tokens(&messages) <= SUMMARIZE_THRESHOLD_TOKENS {
         return Ok(messages);
     }
     let split = keep_boundary(&history);
@@ -610,6 +611,9 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         Ok(subject) => subject,
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = ensure_message_fits(&req.message) {
+        return err.into_response();
+    }
     let admin = state.auth.require_admin(token).is_ok();
     let choice = match crate::models::stored_choice(&state.db, subject.as_deref()) {
         Ok(choice) => choice,
@@ -883,6 +887,45 @@ mod tests {
         assert!(
             db.count_run("alice", DAY, 2).unwrap(),
             "the refused run took a slot"
+        );
+        assert!(db.active_session(Some("alice")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_is_refused_before_anything_is_stored() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        let body = json!({
+            "system_prompt": "s",
+            "message": "x".repeat(crate::sessions::MAX_USER_MESSAGE_BYTES + 1),
+            "user_token": crate::auth::testing::token_for("alice"),
+        });
+        let response = crate::router(gated_state(db.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let error = serde_json::from_slice::<Value>(&bytes).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains(&crate::sessions::MAX_USER_MESSAGE_BYTES.to_string()),
+            "{error}"
         );
         assert!(db.active_session(Some("alice")).unwrap().is_none());
     }
@@ -1521,6 +1564,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(again.len(), 1 + KEEP_RECENT_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn a_full_history_window_summarizes_below_the_token_threshold() {
+        let temp = TempDb::new();
+        let session = temp.db.create_session("chat", None).unwrap();
+        for i in 0..MAX_LOADED_HISTORY_MESSAGES + 10 {
+            temp.db
+                .append_message(&session.id, &NewMessage::user(format!("short {i}")))
+                .unwrap();
+        }
+
+        let messages = assemble(&temp.db, &session.id, "be useful", |older| async move {
+            assert_eq!(
+                older.len(),
+                MAX_LOADED_HISTORY_MESSAGES - KEEP_RECENT_MESSAGES
+            );
+            assert_eq!(older[0].content.as_deref(), Some("short 10"));
+            Ok("canned summary".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 1 + KEEP_RECENT_MESSAGES);
     }
 
     #[tokio::test]

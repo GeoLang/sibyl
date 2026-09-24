@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
   caps their prompt plus completion tokens, charged like the spend cap on
   every model call of a run, the summary call included. Both totals are rows
   in sibyl.db, so a restart keeps them. With the gate off neither applies.
+  `SIBYL_RUNS_PER_ADMIN_PER_DAY` and `SIBYL_TOKENS_PER_ADMIN_PER_DAY` give an
+  `admin` bearer its own, higher limits for eval sweeps, and fall back to the
+  user values when unset.
 - 2026-09-23: **provider settings need the admin role.** `PUT /model/cloud`,
   `PUT /model/providers` and `DELETE /model/providers/{id}` accepted any
   platform user, so a viewer could point the shared cloud provider at their

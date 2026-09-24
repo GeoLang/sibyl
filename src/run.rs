@@ -605,13 +605,12 @@ fn resolve_session(
 }
 
 pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
-    let subject = match state
-        .auth
-        .subject(req.user_token.as_ref().map(UserToken::as_str))
-    {
+    let token = req.user_token.as_ref().map(UserToken::as_str);
+    let subject = match state.auth.subject(token) {
         Ok(subject) => subject,
         Err(err) => return err.into_response(),
     };
+    let admin = state.auth.require_admin(token).is_ok();
     let choice = match crate::models::stored_choice(&state.db, subject.as_deref()) {
         Ok(choice) => choice,
         Err(err) => return ApiError::from(err).into_response(),
@@ -633,11 +632,11 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         // with the gate off there is no subject to limit
         let daily = state.daily_limits.clone().zip(subject.clone());
         if let Some((limits, subject)) = &daily
-            && let Err(err) = limits.count_run(subject)
+            && let Err(err) = limits.count_run(subject, admin)
         {
             return sink.fail(err).await;
         }
-        let user_tokens = daily.and_then(|(limits, subject)| limits.tokens_for(&subject));
+        let user_tokens = daily.and_then(|(limits, subject)| limits.tokens_for(&subject, admin));
         let session = match resolve_session(&state.db, req.thread_id.as_deref(), subject.as_deref())
         {
             Ok(session) => Some(session),
@@ -811,14 +810,21 @@ mod tests {
     }
 
     async fn post_as_alice(state: AppState, profile: Option<&str>) -> (StatusCode, Vec<u8>) {
-        use crate::auth::testing::token_for;
+        post_with_token(state, crate::auth::testing::token_for("alice"), profile).await
+    }
+
+    async fn post_with_token(
+        state: AppState,
+        token: String,
+        profile: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
         use axum::http::Request;
         use tower::ServiceExt;
 
         let mut body = json!({
             "system_prompt": "s",
             "message": "m",
-            "user_token": token_for("alice"),
+            "user_token": token,
         });
         if let Some(profile) = profile {
             body["profile"] = profile.into();
@@ -882,6 +888,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_admin_run_counts_against_the_admin_allowance() {
+        use crate::daily_limits::Allowance;
+        use crate::daily_limits::testing::{DAY, tiered_limits};
+
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        let mut state = gated_state(db.clone());
+        let one_run = Allowance {
+            runs_per_day: Some(1),
+            tokens_per_day: None,
+        };
+        let two_runs = Allowance {
+            runs_per_day: Some(2),
+            tokens_per_day: None,
+        };
+        state.daily_limits = Some(tiered_limits(db.clone(), one_run, two_runs));
+        assert!(db.count_run("owner", DAY, 1).unwrap());
+
+        let token = crate::auth::testing::admin_token_for("owner");
+        let (_, bytes) = post_with_token(state, token, None).await;
+        let body = String::from_utf8(bytes).unwrap();
+        assert!(
+            !body.contains(crate::daily_limits::RUNS_USED_MESSAGE),
+            "{body}"
+        );
+        assert!(
+            !db.count_run("owner", DAY, 2).unwrap(),
+            "the admin run was not counted"
+        );
+    }
+
+    #[tokio::test]
     async fn a_locked_deployment_refuses_a_run_pinned_to_another_profile() {
         let temp = TempDb::new();
         let mut state = gated_state(Arc::new(temp.reopen()));
@@ -913,7 +951,9 @@ mod tests {
         let temp = TempDb::new();
         let db = Arc::new(temp.reopen());
         db.add_tokens("alice", DAY, 10).unwrap();
-        let tokens = limits(db, None, Some(10)).tokens_for("alice").unwrap();
+        let tokens = limits(db, None, Some(10))
+            .tokens_for("alice", false)
+            .unwrap();
         let client = Client::new(
             reqwest::Client::new(),
             "http://127.0.0.1:1/v1".into(),

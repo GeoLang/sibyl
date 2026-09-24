@@ -481,7 +481,7 @@ mod tests {
 
     fn user_tokens(db: Arc<crate::db::Db>) -> UserTokens {
         crate::daily_limits::testing::limits(db, None, Some(2_000_000))
-            .tokens_for("alice")
+            .tokens_for("alice", false)
             .unwrap()
     }
 

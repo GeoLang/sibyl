@@ -30,6 +30,8 @@ In the GeoLang platform the executor is [geolang](https://github.com/GeoLang/geo
 | `SIBYL_LOCKED_PROFILE` | unset | a profile id, e.g. `cloud:openai.gpt-oss-120b`. Every run uses it, `PUT /model` and `PUT /model/default` answer 409, and startup fails when it names no available profile |
 | `SIBYL_RUNS_PER_USER_PER_DAY` | unset | runs one platform user may start per UTC day, counted in `SIBYL_DB_PATH`. Needs `PLATFORM_JWT_SECRET` |
 | `SIBYL_TOKENS_PER_USER_PER_DAY` | unset | prompt plus completion tokens one platform user may spend per UTC day, as the model reports them, counted in `SIBYL_DB_PATH`. Needs `PLATFORM_JWT_SECRET` |
+| `SIBYL_RUNS_PER_ADMIN_PER_DAY` | the user value | the same limit for a bearer with the `admin` role, so an eval sweep can run past the user limit |
+| `SIBYL_TOKENS_PER_ADMIN_PER_DAY` | the user value | the same limit for a bearer with the `admin` role |
 | `SIBYL_THINKING` | unset | `1`/`true` asks the local llama-server for thinking per request (`chat_template_kwargs`) with qwen's thinking sampling, overriding its startup `--reasoning off`. Local profiles only, cloud requests are untouched |
 
 An empty value counts as unset and falls back to the default, so a compose `${VAR:-}` pass-through cannot blank a base URL or a model list.
@@ -212,7 +214,7 @@ Every `/sessions` route reads the bearer from the `Authorization` header, and `/
 
 A switch applies to the next run. A run already going finishes on the profile it started with.
 
-With `SIBYL_RUNS_PER_USER_PER_DAY` set, a run past the caller's limit for the UTC day ends its stream with an `error` event saying today's runs are used, then `done`, and is not counted. With `SIBYL_TOKENS_PER_USER_PER_DAY` set, every model call of a run, the summary call included, asks for `stream_options.include_usage`, charges an input estimate before the call and the reported tokens after it, and is refused with "Today's model budget is used up" once the caller's total for the UTC day reaches the limit. Both totals are rows in sibyl.db, so a restart keeps them. With the gate off no run has a user, so neither limit applies and startup logs that.
+With `SIBYL_RUNS_PER_USER_PER_DAY` set, a run past the caller's limit for the UTC day ends its stream with an `error` event saying today's runs are used, then `done`, and is not counted. With `SIBYL_TOKENS_PER_USER_PER_DAY` set, every model call of a run, the summary call included, asks for `stream_options.include_usage`, charges an input estimate before the call and the reported tokens after it, and is refused with "Today's model budget is used up" once the caller's total for the UTC day reaches the limit. Both totals are rows in sibyl.db, so a restart keeps them. A caller with the `admin` role counts against `SIBYL_RUNS_PER_ADMIN_PER_DAY` and `SIBYL_TOKENS_PER_ADMIN_PER_DAY` instead, which fall back to the user values when unset. With the gate off no run has a user, so neither limit applies and startup logs that.
 
 Run events, one JSON object per line: `text`, `tool_call`, `tool_return`, `error`, `done`. Every stream ends with `done`. A run that hits `SIBYL_MAX_MODEL_CALLS` or `SIBYL_RUN_BUDGET_SECS` ends with an `error` event naming which one it was. So does a tool called three times in a row with the same arguments and the same result, whether it succeeded or failed. When a run ends on an error, sibyl appends an assistant message `I could not finish: <error>` to the session, so the next prompt reads the earlier request as closed rather than finishing it unasked.
 

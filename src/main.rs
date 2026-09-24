@@ -26,7 +26,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::Auth;
-use crate::daily_limits::DailyLimits;
+use crate::daily_limits::{Allowance, DailyLimits};
 use crate::db::Db;
 use crate::models::{ACTIVE_KEY, Models};
 use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
@@ -193,11 +193,27 @@ async fn main() -> Result<()> {
         );
     }
     let default_label = models.default_label();
-    let daily_limits = DailyLimits::new(
-        db.clone(),
-        parse_optional(daily_limits::RUNS_ENV, env_var(daily_limits::RUNS_ENV))?,
-        parse_optional(daily_limits::TOKENS_ENV, env_var(daily_limits::TOKENS_ENV))?,
-    );
+    let users = Allowance {
+        runs_per_day: parse_optional(daily_limits::RUNS_ENV, env_var(daily_limits::RUNS_ENV))?,
+        tokens_per_day: parse_optional(
+            daily_limits::TOKENS_ENV,
+            env_var(daily_limits::TOKENS_ENV),
+        )?,
+    };
+    // an unset admin value keeps admins on the user allowance
+    let admins = Allowance {
+        runs_per_day: parse_optional(
+            daily_limits::ADMIN_RUNS_ENV,
+            env_var(daily_limits::ADMIN_RUNS_ENV),
+        )?
+        .or(users.runs_per_day),
+        tokens_per_day: parse_optional(
+            daily_limits::ADMIN_TOKENS_ENV,
+            env_var(daily_limits::ADMIN_TOKENS_ENV),
+        )?
+        .or(users.tokens_per_day),
+    };
+    let daily_limits = DailyLimits::new(db.clone(), users, admins);
     if daily_limits.is_some() && auth.unauthenticated() {
         info!(
             "{} and {} do not apply: with {} unset no run has a user to count against",

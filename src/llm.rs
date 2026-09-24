@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::daily_limits::UserTokens;
 use crate::spend::SpendCap;
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
@@ -319,15 +320,23 @@ impl Client {
     /// streams the completion and accumulates it server side. streaming is what
     /// lets a dropped run stop generation at the server instead of paying for the
     /// whole answer nobody is waiting for.
-    pub async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<Turn> {
-        let body = self.body(messages, tools);
-        let charge = match &self.spend_cap {
-            Some(cap) => {
-                let estimated_input_tokens = body.to_string().len() / ESTIMATED_BYTES_PER_TOKEN;
-                Some(cap.charge_estimate(&self.model, estimated_input_tokens as u64)?)
-            }
-            None => None,
-        };
+    pub async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        user_tokens: Option<&UserTokens>,
+    ) -> Result<Turn> {
+        let body = self.body(messages, tools, user_tokens);
+        let estimated_input_tokens = (body.to_string().len() / ESTIMATED_BYTES_PER_TOKEN) as u64;
+        // a refused user must not add to the shared spend
+        let token_charge = user_tokens
+            .map(|tokens| tokens.charge_estimate(estimated_input_tokens))
+            .transpose()?;
+        let charge = self
+            .spend_cap
+            .as_ref()
+            .map(|cap| cap.charge_estimate(&self.model, estimated_input_tokens))
+            .transpose()?;
         let mut request = self
             .http
             .post(format!("{}/chat/completions", self.api_base))
@@ -340,13 +349,21 @@ impl Client {
             Err(err) => bail!("{}", explain_transport(&err, self.api_key.is_none())),
         };
         let (turn, usage) = self.stream_turn(response).await?;
+        if let (Some(tokens), Some(charge), Some(usage)) = (user_tokens, token_charge, usage) {
+            tokens.settle(charge, usage)?;
+        }
         if let (Some(cap), Some(charge), Some(usage)) = (&self.spend_cap, charge, usage) {
             cap.settle(&self.model, charge, usage)?;
         }
         Ok(turn)
     }
 
-    fn body(&self, messages: &[ChatMessage], tools: &[Value]) -> Value {
+    fn body(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        user_tokens: Option<&UserTokens>,
+    ) -> Value {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
@@ -358,7 +375,7 @@ impl Client {
         if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = max_tokens.into();
         }
-        if self.spend_cap.is_some() {
+        if self.spend_cap.is_some() || user_tokens.is_some() {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
         if self.thinking {
@@ -430,9 +447,9 @@ mod tests {
     fn a_capped_client_asks_for_usage_and_an_uncapped_one_does_not() {
         let temp = crate::db::testing::TempDb::new();
         let cap = crate::spend::testing::cap(Arc::new(temp.reopen()), 50.0);
-        let capped = capped_client(cap).body(&[ChatMessage::user("hi")], &[]);
+        let capped = capped_client(cap).body(&[ChatMessage::user("hi")], &[], None);
         assert_eq!(capped["stream_options"]["include_usage"], true);
-        let uncapped = client(false).body(&[ChatMessage::user("hi")], &[]);
+        let uncapped = client(false).body(&[ChatMessage::user("hi")], &[], None);
         assert!(uncapped.get("stream_options").is_none());
     }
 
@@ -442,7 +459,7 @@ mod tests {
         let db = Arc::new(temp.reopen());
         db.add_spend(crate::spend::testing::MONTH, 50.0).unwrap();
         let err = capped_client(crate::spend::testing::cap(db, 50.0))
-            .chat(&[ChatMessage::user("hi")], &[])
+            .chat(&[ChatMessage::user("hi")], &[], None)
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), crate::spend::SPENT_MESSAGE);
@@ -455,11 +472,57 @@ mod tests {
         let cap = crate::spend::testing::cap(db.clone(), 50.0);
         let prompt = "x".repeat(4_000_000);
         capped_client(cap)
-            .chat(&[ChatMessage::user(prompt)], &[])
+            .chat(&[ChatMessage::user(prompt)], &[], None)
             .await
             .unwrap_err();
         let spent = db.month_spend(crate::spend::testing::MONTH).unwrap();
         assert!(spent >= 0.15, "charged {spent}");
+    }
+
+    fn user_tokens(db: Arc<crate::db::Db>) -> UserTokens {
+        crate::daily_limits::testing::limits(db, None, Some(2_000_000))
+            .tokens_for("alice")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_per_user_token_limit_asks_for_usage_without_a_spend_cap() {
+        let temp = crate::db::testing::TempDb::new();
+        let tokens = user_tokens(Arc::new(temp.reopen()));
+        let body = client(false).body(&[ChatMessage::user("hi")], &[], Some(&tokens));
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn a_used_up_user_day_refuses_before_the_model_is_called() {
+        let temp = crate::db::testing::TempDb::new();
+        let db = Arc::new(temp.reopen());
+        db.add_tokens("alice", crate::daily_limits::testing::DAY, 2_000_000)
+            .unwrap();
+        let err = client(false)
+            .chat(&[ChatMessage::user("hi")], &[], Some(&user_tokens(db)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), crate::daily_limits::TOKENS_USED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_never_reaches_the_model_still_counts_against_the_user() {
+        let temp = crate::db::testing::TempDb::new();
+        let db = Arc::new(temp.reopen());
+        let prompt = "x".repeat(4_000);
+        client(false)
+            .chat(
+                &[ChatMessage::user(prompt)],
+                &[],
+                Some(&user_tokens(db.clone())),
+            )
+            .await
+            .unwrap_err();
+        let used = db
+            .day_tokens("alice", crate::daily_limits::testing::DAY)
+            .unwrap();
+        assert!(used >= 1_000, "charged {used}");
     }
 
     // bedrock's openai endpoint sends usage in its own chunk after finish_reason
@@ -488,7 +551,7 @@ mod tests {
 
     #[test]
     fn thinking_adds_the_template_kwarg_and_qwen_sampling() {
-        let body = client(true).body(&[ChatMessage::user("hi")], &[]);
+        let body = client(true).body(&[ChatMessage::user("hi")], &[], None);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["temperature"], 0.6);
         assert_eq!(body["top_p"], 0.95);
@@ -498,7 +561,7 @@ mod tests {
     /// no sampling overrides
     #[test]
     fn without_thinking_the_body_carries_no_extras() {
-        let body = client(false).body(&[ChatMessage::user("hi")], &[]);
+        let body = client(false).body(&[ChatMessage::user("hi")], &[], None);
         for key in ["chat_template_kwargs", "temperature", "top_p"] {
             assert!(body.get(key).is_none(), "{key} leaked into the body");
         }

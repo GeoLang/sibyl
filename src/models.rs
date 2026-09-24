@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::auth;
+use crate::auth::{self, AuthError};
 use crate::db::Db;
 use crate::llm::Client;
 use crate::sessions::ApiError;
@@ -51,6 +51,9 @@ pub const LOCAL_DOWN_MESSAGE: &str =
     "The local model isn't running. Start it, or pick a cloud model in Settings.";
 
 pub const PROFILE_LIST_HINT: &str = "GET /models lists the valid profile ids.";
+
+pub const LOCKED_PROFILE_ENV: &str = "SIBYL_LOCKED_PROFILE";
+pub const LOCKED_MESSAGE: &str = "The model is fixed on this deployment.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -377,7 +380,7 @@ pub enum CloudError {
 struct Inner {
     providers: Vec<Provider>,
     profiles: Vec<Profile>,
-    active: String,
+    default_profile: String,
 }
 
 pub struct Models {
@@ -385,6 +388,7 @@ pub struct Models {
     max_tokens: Option<u32>,
     thinking: bool,
     spend_cap: Option<Arc<SpendCap>>,
+    locked: Option<String>,
     inner: Mutex<Inner>,
 }
 
@@ -399,7 +403,7 @@ impl Models {
     ) -> Self {
         let profiles = profiles_from(http, &providers, max_tokens, thinking, &spend_cap);
         let fallback = fallback_id(&profiles);
-        let active = stored
+        let default_profile = stored
             .filter(|id| {
                 profiles
                     .iter()
@@ -411,12 +415,44 @@ impl Models {
             max_tokens,
             thinking,
             spend_cap,
+            locked: None,
             inner: Mutex::new(Inner {
                 providers,
                 profiles,
-                active,
+                default_profile,
             }),
         }
+    }
+
+    pub fn lock_to(&mut self, id: &str) -> Result<()> {
+        if self.resolve(id).is_err() {
+            let available: Vec<String> = self
+                .inner()
+                .profiles
+                .iter()
+                .filter(|profile| profile.available())
+                .map(|profile| profile.id.clone())
+                .collect();
+            bail!(
+                "{LOCKED_PROFILE_ENV} is \"{id}\", which is not an available profile. Available: {}",
+                available.join(", ")
+            );
+        }
+        self.locked = Some(id.to_string());
+        Ok(())
+    }
+
+    pub fn locked(&self) -> Option<&str> {
+        self.locked.as_deref()
+    }
+
+    pub fn caller_profile(&self, choice: Option<&str>) -> String {
+        if let Some(locked) = &self.locked {
+            return locked.clone();
+        }
+        choice
+            .and_then(|id| self.resolve(id).ok())
+            .unwrap_or_else(|| self.default_profile())
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -434,14 +470,14 @@ impl Models {
         if !inner
             .profiles
             .iter()
-            .any(|profile| profile.id == inner.active && profile.available())
+            .any(|profile| profile.id == inner.default_profile && profile.available())
         {
-            inner.active = fallback_id(&inner.profiles);
+            inner.default_profile = fallback_id(&inner.profiles);
         }
     }
 
-    pub fn active(&self) -> String {
-        self.inner().active.clone()
+    pub fn default_profile(&self) -> String {
+        self.inner().default_profile.clone()
     }
 
     pub fn client_for(&self, id: &str) -> Option<Arc<Client>> {
@@ -453,16 +489,16 @@ impl Models {
             .and_then(|profile| profile.client.clone())
     }
 
-    pub fn active_client(&self) -> Option<Arc<Client>> {
-        self.client_for(&self.active())
+    pub fn default_client(&self) -> Option<Arc<Client>> {
+        self.client_for(&self.default_profile())
     }
 
-    pub fn active_label(&self) -> String {
+    pub fn default_label(&self) -> String {
         let inner = self.inner();
         inner
             .profiles
             .iter()
-            .find(|profile| profile.id == inner.active)
+            .find(|profile| profile.id == inner.default_profile)
             .map_or_else(String::new, |profile| profile.label.clone())
     }
 
@@ -489,15 +525,26 @@ impl Models {
             .map(|profile| (profile.server, profile.provider.clone(), profile.id.clone()))
     }
 
-    pub fn activate(&self, id: &str) {
-        self.inner().active = id.to_string();
+    pub fn set_default(&self, id: &str) {
+        self.inner().default_profile = id.to_string();
     }
 
-    /// the profile a run uses: the id the request pins, else the active one
-    pub fn profile_for_run(&self, requested: Option<&str>) -> Result<String, String> {
+    /// the profile a run uses: the id the request pins, else the caller's one
+    pub fn profile_for_run(
+        &self,
+        requested: Option<&str>,
+        choice: Option<&str>,
+    ) -> Result<String, String> {
         let Some(requested) = requested else {
-            return Ok(self.active());
+            return Ok(self.caller_profile(choice));
         };
+        if let Some(locked) = &self.locked
+            && requested != locked
+        {
+            return Err(format!(
+                "this deployment runs every chat on \"{locked}\", so a run cannot pin \"{requested}\""
+            ));
+        }
         match self.resolve(requested) {
             Ok(id) => Ok(id),
             Err(SwitchError::Unknown) => Err(format!(
@@ -525,10 +572,15 @@ impl Models {
     }
 
     pub fn view(&self) -> Value {
-        self.view_with_reachability(&HashMap::new())
+        self.view_with_reachability(&HashMap::new(), None)
     }
 
-    pub fn view_with_reachability(&self, local_reach: &HashMap<String, bool>) -> Value {
+    pub fn view_with_reachability(
+        &self,
+        local_reach: &HashMap<String, bool>,
+        choice: Option<&str>,
+    ) -> Value {
+        let active = self.caller_profile(choice);
         let inner = self.inner();
         let profiles: Vec<ProfileView> = inner
             .profiles
@@ -573,7 +625,9 @@ impl Models {
             .iter()
             .find(|provider| provider.server == Server::Cloud);
         json!({
-            "active": inner.active,
+            "active": active,
+            "default": inner.default_profile,
+            "locked": self.locked.is_some(),
             "profiles": profiles,
             "providers": providers,
             "cloud": cloud.map(|provider| json!({
@@ -713,11 +767,11 @@ impl Models {
             .iter()
             .any(|profile| profile.id == first_new && profile.available())
         {
-            inner.active = first_new;
+            inner.default_profile = first_new;
         }
         Ok(Upserted {
             id,
-            active: inner.active.clone(),
+            active: inner.default_profile.clone(),
             key: provided_key,
         })
     }
@@ -755,7 +809,7 @@ impl Models {
             key: provided
                 .map(|key| key.trim().to_string())
                 .filter(|key| !key.is_empty()),
-            active: inner.active.clone(),
+            active: inner.default_profile.clone(),
         })
     }
 }
@@ -791,9 +845,33 @@ async fn probe_base(http: &reqwest::Client, base: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub async fn list(State(state): State<AppState>) -> Json<Value> {
+pub fn stored_choice(db: &Db, subject: Option<&str>) -> Result<Option<String>> {
+    Ok(subject
+        .map(|subject| db.model_choice(subject))
+        .transpose()?
+        .flatten())
+}
+
+// a listing without a bearer shows the default, a bad bearer is still refused
+fn optional_subject(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, AuthError> {
+    match auth::bearer(headers) {
+        None => Ok(None),
+        Some(token) => state.auth.subject(Some(token)),
+    }
+}
+
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let subject = optional_subject(&state, &headers)?;
+    let choice = stored_choice(&state.db, subject.as_deref())?;
     let reach = state.models.probe_locals().await;
-    Json(state.models.view_with_reachability(&reach))
+    Ok(Json(
+        state
+            .models
+            .view_with_reachability(&reach, choice.as_deref()),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -801,23 +879,80 @@ pub struct SwitchPayload {
     pub id: String,
 }
 
-pub async fn switch(State(state): State<AppState>, Json(payload): Json<SwitchPayload>) -> Response {
-    let id = match state.models.resolve(&payload.id) {
-        Ok(id) => id,
-        Err(SwitchError::Unknown) => return StatusCode::NOT_FOUND.into_response(),
-        Err(SwitchError::Unavailable) => return StatusCode::CONFLICT.into_response(),
-    };
+fn locked_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": LOCKED_MESSAGE })),
+    )
+        .into_response()
+}
+
+async fn usable_profile(state: &AppState, id: &str) -> Result<String, StatusCode> {
+    let id = state.models.resolve(id).map_err(|err| match err {
+        SwitchError::Unknown => StatusCode::NOT_FOUND,
+        SwitchError::Unavailable => StatusCode::CONFLICT,
+    })?;
     if let Some((Server::Local, provider, _)) = state.models.profile_meta(&id) {
         let reach = state.models.probe_locals().await;
         if reach.get(&provider) == Some(&false) {
-            return StatusCode::CONFLICT.into_response();
+            return Err(StatusCode::CONFLICT);
         }
     }
-    if let Err(err) = state.db.set_config(ACTIVE_KEY, &id) {
-        return ApiError::from(err).into_response();
+    Ok(id)
+}
+
+fn store_default(state: &AppState, id: &str) -> Result<()> {
+    state.db.set_config(ACTIVE_KEY, id)?;
+    state.models.set_default(id);
+    Ok(())
+}
+
+pub async fn switch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SwitchPayload>,
+) -> Response {
+    let subject = match state.auth.subject(auth::bearer(&headers)) {
+        Ok(subject) => subject,
+        Err(err) => return err.into_response(),
+    };
+    if state.models.locked().is_some() {
+        return locked_response();
     }
-    state.models.activate(&id);
-    StatusCode::NO_CONTENT.into_response()
+    let id = match usable_profile(&state, &payload.id).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let stored = match &subject {
+        Some(subject) => state.db.set_model_choice(subject, &id),
+        // with the gate off every caller shares the default
+        None => store_default(&state, &id),
+    };
+    match stored {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+pub async fn switch_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SwitchPayload>,
+) -> Response {
+    if let Err(err) = require_admin(&state, &headers) {
+        return err.into_response();
+    }
+    if state.models.locked().is_some() {
+        return locked_response();
+    }
+    let id = match usable_profile(&state, &payload.id).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match store_default(&state, &id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -874,7 +1009,9 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), auth::Auth
 fn persist_state(state: &AppState) -> Result<(), ApiError> {
     let json = state.models.stored_json()?;
     state.db.set_config(PROVIDERS_KEY, &json)?;
-    state.db.set_config(ACTIVE_KEY, &state.models.active())?;
+    state
+        .db
+        .set_config(ACTIVE_KEY, &state.models.default_profile())?;
     Ok(())
 }
 
@@ -1174,7 +1311,7 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, LOCAL2_NAME);
         let models = models(providers, None);
-        assert_eq!(models.active(), "local2:gpt-oss-20b");
+        assert_eq!(models.default_profile(), "local2:gpt-oss-20b");
         assert_eq!(models.view()["profiles"][0]["server"], LOCAL_NAME);
     }
 
@@ -1184,7 +1321,7 @@ mod tests {
         let view = models.view();
         assert_eq!(view["cloud"]["has_key"], false);
         assert_eq!(view["profiles"][0]["available"], false);
-        assert!(models.active_client().is_none());
+        assert!(models.default_client().is_none());
     }
 
     #[test]
@@ -1197,7 +1334,7 @@ mod tests {
                 models: None,
             })
             .unwrap();
-        assert_eq!(models.active(), CLOUD_ID);
+        assert_eq!(models.default_profile(), CLOUD_ID);
         assert_eq!(models.view()["cloud"]["has_key"], true);
     }
 
@@ -1229,7 +1366,7 @@ mod tests {
             .map(|profile| profile["id"].as_str().unwrap())
             .collect();
         assert_eq!(profile_ids, vec![CLOUD_ID, "anthropic:claude-sonnet-4-5"]);
-        assert_eq!(models.active(), "anthropic:claude-sonnet-4-5");
+        assert_eq!(models.default_profile(), "anthropic:claude-sonnet-4-5");
         let body = serde_json::to_string(&view).unwrap();
         assert!(!body.contains("sk-ant"), "{body}");
         assert!(!body.contains(KEY), "{body}");
@@ -1283,7 +1420,7 @@ mod tests {
         let view = models.view();
         assert_eq!(view["providers"].as_array().unwrap().len(), 1);
         assert_eq!(view["profiles"][0]["id"], LOCAL_ID);
-        assert_eq!(models.active(), LOCAL_ID);
+        assert_eq!(models.default_profile(), LOCAL_ID);
     }
 
     #[test]
@@ -1297,17 +1434,20 @@ mod tests {
 
     #[test]
     fn local_wins_the_default_when_both_are_available() {
-        assert_eq!(models(both(), None).active(), LOCAL_ID);
+        assert_eq!(models(both(), None).default_profile(), LOCAL_ID);
     }
 
     #[test]
     fn a_stored_choice_is_honoured() {
-        assert_eq!(models(both(), Some(CLOUD_ID)).active(), CLOUD_ID);
+        assert_eq!(models(both(), Some(CLOUD_ID)).default_profile(), CLOUD_ID);
     }
 
     #[test]
     fn an_unavailable_stored_choice_falls_back() {
-        assert_eq!(models(local_only(), Some(CLOUD_ID)).active(), LOCAL_ID);
+        assert_eq!(
+            models(local_only(), Some(CLOUD_ID)).default_profile(),
+            LOCAL_ID
+        );
     }
 
     #[tokio::test]
@@ -1320,23 +1460,26 @@ mod tests {
         })
         .unwrap();
         let models = models(providers, Some(LOCAL_ID));
-        assert_eq!(models.active(), LOCAL_ID);
+        assert_eq!(models.default_profile(), LOCAL_ID);
         let err = models.client_for_run(LOCAL_ID).await.err();
         assert_eq!(err.as_deref(), Some(LOCAL_DOWN_MESSAGE));
-        assert_eq!(models.active(), LOCAL_ID);
+        assert_eq!(models.default_profile(), LOCAL_ID);
     }
 
     #[test]
     fn a_run_without_a_pinned_profile_uses_the_active_one() {
         let models = models(both(), Some(CLOUD_ID));
-        assert_eq!(models.profile_for_run(None).unwrap(), CLOUD_ID);
+        assert_eq!(models.profile_for_run(None, None).unwrap(), CLOUD_ID);
     }
 
     #[test]
     fn a_pinned_profile_resolves_without_touching_the_active_one() {
         let models = models(both(), Some(CLOUD_ID));
-        assert_eq!(models.profile_for_run(Some(LOCAL_ID)).unwrap(), LOCAL_ID);
-        assert_eq!(models.active(), CLOUD_ID);
+        assert_eq!(
+            models.profile_for_run(Some(LOCAL_ID), None).unwrap(),
+            LOCAL_ID
+        );
+        assert_eq!(models.default_profile(), CLOUD_ID);
         assert_eq!(
             models.client_for(LOCAL_ID).unwrap().model(),
             LOCAL_MODEL,
@@ -1347,7 +1490,7 @@ mod tests {
     #[test]
     fn an_unknown_pinned_profile_names_it_and_points_at_the_listing() {
         let err = models(both(), None)
-            .profile_for_run(Some("local:not-a-model"))
+            .profile_for_run(Some("local:not-a-model"), None)
             .unwrap_err();
         assert!(err.contains("local:not-a-model"), "{err}");
         assert!(err.contains(PROFILE_LIST_HINT), "{err}");
@@ -1363,19 +1506,85 @@ mod tests {
         })
         .unwrap();
         let err = models(providers, None)
-            .profile_for_run(Some(CLOUD_ID))
+            .profile_for_run(Some(CLOUD_ID), None)
             .unwrap_err();
         assert!(err.contains(CLOUD_ID), "{err}");
         assert!(err.contains(PROFILE_LIST_HINT), "{err}");
     }
 
+    fn keyless_cloud() -> Vec<Provider> {
+        providers_from_config(Config {
+            local_base: Some(LOCAL_BASE.into()),
+            local_models: Some(LOCAL_MODEL.into()),
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_callers_choice_wins_while_it_is_available() {
+        let served = models(both(), None);
+        assert_eq!(served.caller_profile(Some(CLOUD_ID)), CLOUD_ID);
+        assert_eq!(served.caller_profile(None), LOCAL_ID);
+        assert_eq!(served.caller_profile(Some("cloud:gone")), LOCAL_ID);
+        let keyless = models(keyless_cloud(), None);
+        assert_eq!(keyless.caller_profile(Some(CLOUD_ID)), LOCAL_ID);
+    }
+
+    #[test]
+    fn a_run_uses_the_callers_choice_unless_it_pins_one() {
+        let models = models(both(), None);
+        assert_eq!(
+            models.profile_for_run(None, Some(CLOUD_ID)).unwrap(),
+            CLOUD_ID
+        );
+        assert_eq!(
+            models
+                .profile_for_run(Some(LOCAL_ID), Some(CLOUD_ID))
+                .unwrap(),
+            LOCAL_ID
+        );
+    }
+
+    #[test]
+    fn a_lock_must_name_an_available_profile() {
+        let err = models(both(), None)
+            .lock_to("cloud:not-served")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LOCKED_PROFILE_ENV), "{err}");
+        assert!(err.contains(LOCAL_ID), "{err}");
+        assert!(models(keyless_cloud(), None).lock_to(CLOUD_ID).is_err());
+    }
+
+    #[test]
+    fn a_locked_deployment_runs_everything_on_the_locked_profile() {
+        let mut models = models(both(), None);
+        models.lock_to(CLOUD_ID).unwrap();
+        assert_eq!(models.caller_profile(Some(LOCAL_ID)), CLOUD_ID);
+        assert_eq!(
+            models.profile_for_run(None, Some(LOCAL_ID)).unwrap(),
+            CLOUD_ID
+        );
+        assert_eq!(
+            models.profile_for_run(Some(CLOUD_ID), None).unwrap(),
+            CLOUD_ID
+        );
+        let err = models.profile_for_run(Some(LOCAL_ID), None).unwrap_err();
+        assert!(err.contains(LOCAL_ID), "{err}");
+        let view = models.view();
+        assert_eq!(view["locked"], true);
+        assert_eq!(view["active"], CLOUD_ID);
+        assert_eq!(view["default"], LOCAL_ID);
+    }
+
     #[test]
     fn switching_changes_the_client_a_run_would_use() {
         let models = models(both(), None);
-        assert_eq!(models.active_client().unwrap().model(), LOCAL_MODEL);
-        models.activate(&models.resolve(CLOUD_ID).unwrap());
+        assert_eq!(models.default_client().unwrap().model(), LOCAL_MODEL);
+        models.set_default(&models.resolve(CLOUD_ID).unwrap());
         assert_eq!(
-            models.active_client().unwrap().model(),
+            models.default_client().unwrap().model(),
             DEFAULT_CLOUD_MODELS
         );
     }
@@ -1467,7 +1676,7 @@ mod tests {
             .map(|provider| provider["id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["local", "cloud", "anthropic"]);
-        assert_eq!(models.active(), "cloud:grok-4");
+        assert_eq!(models.default_profile(), "cloud:grok-4");
     }
 
     #[test]
@@ -1481,7 +1690,7 @@ mod tests {
             }),
             Err(CloudError::Invalid("base must be an http or https URL"))
         );
-        assert_eq!(models.active(), LOCAL_ID);
+        assert_eq!(models.default_profile(), LOCAL_ID);
     }
 
     mod endpoints {
@@ -1495,6 +1704,7 @@ mod tests {
             AppState {
                 db: Arc::new(db),
                 models: Arc::new(models(providers, None)),
+                daily_limits: None,
                 catalog: Arc::new(ToolCatalog::new(
                     reqwest::Client::new(),
                     "http://127.0.0.1:1".into(),
@@ -1509,6 +1719,7 @@ mod tests {
         async fn put(state: &AppState, id: &str) -> StatusCode {
             switch(
                 State(state.clone()),
+                HeaderMap::new(),
                 Json(SwitchPayload { id: id.to_string() }),
             )
             .await
@@ -1520,7 +1731,7 @@ mod tests {
             let temp = TempDb::new();
             let state = state(both(), temp.reopen());
             assert_eq!(put(&state, CLOUD_ID).await, StatusCode::NO_CONTENT);
-            assert_eq!(state.models.active(), CLOUD_ID);
+            assert_eq!(state.models.default_profile(), CLOUD_ID);
         }
 
         #[tokio::test]
@@ -1545,7 +1756,9 @@ mod tests {
                 serde_json::from_str(&temp.db.get_config(PROVIDERS_KEY).unwrap().unwrap()).unwrap();
             assert_eq!(stored.len(), 2);
             assert_eq!(stored[1].key.as_deref(), Some("sk-ant-saved"));
-            let Json(view) = list(State(state)).await;
+            let Ok(Json(view)) = list(State(state), HeaderMap::new()).await else {
+                panic!("the listing was refused");
+            };
             let body = serde_json::to_string(&view).unwrap();
             assert!(!body.contains("sk-ant-saved"), "{body}");
             assert_eq!(view["providers"].as_array().unwrap().len(), 2);
@@ -1562,7 +1775,7 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            assert_eq!(state.models.active(), LOCAL_ID);
+            assert_eq!(state.models.default_profile(), LOCAL_ID);
         }
 
         #[tokio::test]
@@ -1576,9 +1789,9 @@ mod tests {
             })
             .unwrap();
             let state = state(providers, temp.reopen());
-            state.models.activate(CLOUD_ID);
+            state.models.set_default(CLOUD_ID);
             assert_eq!(put(&state, LOCAL_ID).await, StatusCode::CONFLICT);
-            assert_eq!(state.models.active(), CLOUD_ID);
+            assert_eq!(state.models.default_profile(), CLOUD_ID);
         }
 
         #[tokio::test]
@@ -1627,6 +1840,195 @@ mod tests {
             assert_eq!(editor.status(), StatusCode::FORBIDDEN);
             let admin = put_as(admin_token_for("owner")).await.unwrap();
             assert_eq!(admin.status(), StatusCode::NO_CONTENT);
+        }
+
+        mod per_user {
+            use super::*;
+            use crate::auth::testing::{SECRET, admin_token_for, token_for};
+            use axum::body::Body;
+            use axum::http::{Method, Request};
+            use tower::ServiceExt;
+
+            const DOWN_LOCAL_BASE: &str = "http://127.0.0.1:1/v1";
+
+            fn gated(temp: &TempDb, locked: Option<&str>) -> AppState {
+                let mut state = crate::testing::state(
+                    Arc::new(temp.reopen()),
+                    crate::auth::Auth::new(Some(SECRET.into()), false).unwrap(),
+                );
+                let mut models = models(
+                    providers_from_config(Config {
+                        cloud_key: Some(KEY.into()),
+                        local_base: Some(DOWN_LOCAL_BASE.into()),
+                        local_models: Some(LOCAL_MODEL.into()),
+                        ..Config::default()
+                    })
+                    .unwrap(),
+                    None,
+                );
+                if let Some(locked) = locked {
+                    models.lock_to(locked).unwrap();
+                }
+                state.models = Arc::new(models);
+                state
+            }
+
+            async fn send(
+                state: &AppState,
+                method: Method,
+                uri: &str,
+                token: Option<String>,
+                body: Option<String>,
+            ) -> (StatusCode, Value) {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                let response = crate::router(state.clone())
+                    .oneshot(request.body(Body::from(body.unwrap_or_default())).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            fn pick(id: &str) -> Option<String> {
+                Some(json!({ "id": id }).to_string())
+            }
+
+            #[tokio::test]
+            async fn each_user_picks_their_own_model() {
+                let temp = TempDb::new();
+                let state = gated(&temp, None);
+
+                let (anonymous, _) =
+                    send(&state, Method::PUT, "/model", None, pick(CLOUD_ID)).await;
+                assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+                let (alice_put, _) = send(
+                    &state,
+                    Method::PUT,
+                    "/model",
+                    Some(token_for("alice")),
+                    pick(CLOUD_ID),
+                )
+                .await;
+                assert_eq!(alice_put, StatusCode::NO_CONTENT);
+
+                let (_, alice) = send(
+                    &state,
+                    Method::GET,
+                    "/models",
+                    Some(token_for("alice")),
+                    None,
+                )
+                .await;
+                assert_eq!(alice["active"], CLOUD_ID);
+                assert_eq!(alice["default"], LOCAL_ID);
+                assert_eq!(alice["locked"], false);
+                let (_, bob) =
+                    send(&state, Method::GET, "/models", Some(token_for("bob")), None).await;
+                assert_eq!(bob["active"], LOCAL_ID);
+                let (_, anonymous) = send(&state, Method::GET, "/models", None, None).await;
+                assert_eq!(anonymous["active"], LOCAL_ID);
+                let (forged, _) = send(
+                    &state,
+                    Method::GET,
+                    "/models",
+                    Some("not-a-jwt".into()),
+                    None,
+                )
+                .await;
+                assert_eq!(forged, StatusCode::UNAUTHORIZED);
+
+                assert_eq!(state.models.default_profile(), LOCAL_ID);
+                assert_eq!(
+                    stored_choice(&temp.db, Some("alice")).unwrap().as_deref(),
+                    Some(CLOUD_ID)
+                );
+            }
+
+            #[tokio::test]
+            async fn only_an_admin_moves_the_default() {
+                let temp = TempDb::new();
+                let state = gated(&temp, None);
+
+                let (editor, _) = send(
+                    &state,
+                    Method::PUT,
+                    "/model/default",
+                    Some(token_for("alice")),
+                    pick(CLOUD_ID),
+                )
+                .await;
+                assert_eq!(editor, StatusCode::FORBIDDEN);
+                assert_eq!(state.models.default_profile(), LOCAL_ID);
+
+                let (admin, _) = send(
+                    &state,
+                    Method::PUT,
+                    "/model/default",
+                    Some(admin_token_for("owner")),
+                    pick(CLOUD_ID),
+                )
+                .await;
+                assert_eq!(admin, StatusCode::NO_CONTENT);
+                assert_eq!(state.models.default_profile(), CLOUD_ID);
+                assert_eq!(
+                    temp.db.get_config(ACTIVE_KEY).unwrap().as_deref(),
+                    Some(CLOUD_ID)
+                );
+                let (_, bob) =
+                    send(&state, Method::GET, "/models", Some(token_for("bob")), None).await;
+                assert_eq!(bob["active"], CLOUD_ID);
+            }
+
+            #[tokio::test]
+            async fn a_locked_deployment_refuses_every_switch() {
+                let temp = TempDb::new();
+                let state = gated(&temp, Some(CLOUD_ID));
+
+                let (user, body) = send(
+                    &state,
+                    Method::PUT,
+                    "/model",
+                    Some(token_for("alice")),
+                    pick(LOCAL_ID),
+                )
+                .await;
+                assert_eq!(user, StatusCode::CONFLICT);
+                assert_eq!(body["error"], LOCKED_MESSAGE);
+                let (admin, body) = send(
+                    &state,
+                    Method::PUT,
+                    "/model/default",
+                    Some(admin_token_for("owner")),
+                    pick(LOCAL_ID),
+                )
+                .await;
+                assert_eq!(admin, StatusCode::CONFLICT);
+                assert_eq!(body["error"], LOCKED_MESSAGE);
+
+                let (_, listing) = send(
+                    &state,
+                    Method::GET,
+                    "/models",
+                    Some(token_for("alice")),
+                    None,
+                )
+                .await;
+                assert_eq!(listing["locked"], true);
+                assert_eq!(listing["active"], CLOUD_ID);
+                assert_eq!(stored_choice(&temp.db, Some("alice")).unwrap(), None);
+            }
         }
     }
 }

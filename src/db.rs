@@ -120,6 +120,17 @@ impl Db {
             CREATE TABLE IF NOT EXISTS model_spend (
                 month TEXT PRIMARY KEY,
                 usd REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS model_choices (
+                subject TEXT PRIMARY KEY,
+                profile TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS daily_usage (
+                subject TEXT NOT NULL,
+                day TEXT NOT NULL,
+                runs INTEGER NOT NULL DEFAULT 0,
+                tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (subject, day)
             );",
         )?;
         migrate_sessions(&conn)?;
@@ -373,6 +384,70 @@ impl Db {
             "INSERT INTO model_spend (month, usd) VALUES (?1, ?2)
              ON CONFLICT(month) DO UPDATE SET usd = usd + excluded.usd",
             params![month, usd],
+        )?;
+        Ok(())
+    }
+
+    pub fn model_choice(&self, subject: &str) -> Result<Option<String>> {
+        let profile = self
+            .conn()
+            .query_row(
+                "SELECT profile FROM model_choices WHERE subject = ?1",
+                params![subject],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(profile)
+    }
+
+    pub fn set_model_choice(&self, subject: &str, profile: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO model_choices (subject, profile) VALUES (?1, ?2)
+             ON CONFLICT(subject) DO UPDATE SET profile = excluded.profile",
+            params![subject, profile],
+        )?;
+        Ok(())
+    }
+
+    // one lock across the read and the bump, else two runs take the last slot
+    pub fn count_run(&self, subject: &str, day: &str, runs_per_day: u64) -> Result<bool> {
+        let conn = self.conn();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT runs FROM daily_usage WHERE subject = ?1 AND day = ?2",
+                params![subject, day],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if runs as u64 >= runs_per_day {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO daily_usage (subject, day, runs) VALUES (?1, ?2, 1)
+             ON CONFLICT(subject, day) DO UPDATE SET runs = runs + 1",
+            params![subject, day],
+        )?;
+        Ok(true)
+    }
+
+    pub fn day_tokens(&self, subject: &str, day: &str) -> Result<i64> {
+        let tokens = self
+            .conn()
+            .query_row(
+                "SELECT tokens FROM daily_usage WHERE subject = ?1 AND day = ?2",
+                params![subject, day],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(tokens.unwrap_or(0))
+    }
+
+    pub fn add_tokens(&self, subject: &str, day: &str, tokens: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO daily_usage (subject, day, tokens) VALUES (?1, ?2, ?3)
+             ON CONFLICT(subject, day) DO UPDATE SET tokens = tokens + excluded.tokens",
+            params![subject, day, tokens],
         )?;
         Ok(())
     }

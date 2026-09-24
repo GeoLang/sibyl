@@ -19,8 +19,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::AppState;
+use crate::daily_limits::UserTokens;
 use crate::db::{Db, NewMessage, StoredMessage};
 use crate::llm::{ChatMessage, Client, ToolCall, Turn, estimated_tokens};
+use crate::sessions::ApiError;
 use crate::tools::UserToken;
 
 pub const DEFAULT_MAX_MODEL_CALLS: usize = 30;
@@ -98,7 +100,7 @@ pub struct RunRequest {
     #[serde(default)]
     pub document: Option<String>,
     /// the exact model profile id this run uses, as `GET /models` lists them.
-    /// absent uses the active profile, and a pinned one never changes it.
+    /// absent uses the caller's profile, and a pinned one never changes it.
     #[serde(default)]
     pub profile: Option<String>,
     /// tools this run is not offered: geolang names the ones a viewer action
@@ -402,12 +404,16 @@ fn tool_names(tools: &[Value]) -> HashSet<&str> {
 const SUMMARY_INSTRUCTION: &str = "Summarize the conversation below into a compact briefing. \
 Preserve dataset names, file paths, key results, and open threads. Keep it factual, no preamble.";
 
-async fn summarize_with_model(client: &Client, older: Vec<ChatMessage>) -> Result<String> {
+async fn summarize_with_model(
+    client: &Client,
+    older: Vec<ChatMessage>,
+    user_tokens: Option<&UserTokens>,
+) -> Result<String> {
     let messages = vec![
         ChatMessage::system(SUMMARY_INSTRUCTION),
         ChatMessage::user(flatten_for_summary(&older)),
     ];
-    let turn = client.chat(&messages, &[]).await?;
+    let turn = client.chat(&messages, &[], user_tokens).await?;
     turn.text.context("summarizer returned no text")
 }
 
@@ -492,6 +498,7 @@ async fn agent_loop(
     session_id: &str,
     req: &RunRequest,
     profile: &str,
+    user_tokens: Option<&UserTokens>,
     sink: &EventSink,
 ) {
     let mut tools = match state.catalog.tools().await {
@@ -520,11 +527,11 @@ async fn agent_loop(
             |messages| {
                 let client = client.clone();
                 let tools = tools.clone();
-                async move { client.chat(&messages, &tools).await }
+                async move { client.chat(&messages, &tools, user_tokens).await }
             },
             |older| {
                 let client = client.clone();
-                async move { summarize_with_model(&client, older).await }
+                async move { summarize_with_model(&client, older, user_tokens).await }
             },
             |name, args| {
                 let catalog = state.catalog.clone();
@@ -605,7 +612,14 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         Ok(subject) => subject,
         Err(err) => return err.into_response(),
     };
-    let profile = match state.models.profile_for_run(req.profile.as_deref()) {
+    let choice = match crate::models::stored_choice(&state.db, subject.as_deref()) {
+        Ok(choice) => choice,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let profile = match state
+        .models
+        .profile_for_run(req.profile.as_deref(), choice.as_deref())
+    {
         Ok(profile) => profile,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
@@ -616,6 +630,14 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
     let sink = EventSink::new(tx);
 
     let task = tokio::spawn(async move {
+        // with the gate off there is no subject to limit
+        let daily = state.daily_limits.clone().zip(subject.clone());
+        if let Some((limits, subject)) = &daily
+            && let Err(err) = limits.count_run(subject)
+        {
+            return sink.fail(err).await;
+        }
+        let user_tokens = daily.and_then(|(limits, subject)| limits.tokens_for(&subject));
         let session = match resolve_session(&state.db, req.thread_id.as_deref(), subject.as_deref())
         {
             Ok(session) => Some(session),
@@ -635,7 +657,15 @@ pub async fn post_run(State(state): State<AppState>, Json(req): Json<RunRequest>
         {
             return sink.fail(err).await;
         }
-        agent_loop(&state, &session.id, &req, &profile, &sink).await;
+        agent_loop(
+            &state,
+            &session.id,
+            &req,
+            &profile,
+            user_tokens.as_ref(),
+            &sink,
+        )
+        .await;
     });
 
     (
@@ -778,6 +808,125 @@ mod tests {
             .to_string();
         assert!(error.contains("local:nope"), "{error}");
         assert!(error.contains(crate::models::PROFILE_LIST_HINT), "{error}");
+    }
+
+    async fn post_as_alice(state: AppState, profile: Option<&str>) -> (StatusCode, Vec<u8>) {
+        use crate::auth::testing::token_for;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut body = json!({
+            "system_prompt": "s",
+            "message": "m",
+            "user_token": token_for("alice"),
+        });
+        if let Some(profile) = profile {
+            body["profile"] = profile.into();
+        }
+        let response = crate::router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    fn gated_state(db: Arc<Db>) -> AppState {
+        crate::testing::state(
+            db,
+            crate::auth::Auth::new(Some(crate::auth::testing::SECRET.into()), false).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_run_past_the_daily_run_limit_ends_with_an_error_and_is_not_counted() {
+        use crate::daily_limits::testing::{DAY, limits};
+
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        let mut state = gated_state(db.clone());
+        state.daily_limits = Some(limits(db.clone(), Some(1), None));
+        assert!(db.count_run("alice", DAY, 1).unwrap());
+
+        let (status, bytes) = post_as_alice(state, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<Event> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::Error {
+                    message: crate::daily_limits::RUNS_USED_MESSAGE.into()
+                },
+                Event::Done,
+            ]
+        );
+        assert!(
+            db.count_run("alice", DAY, 2).unwrap(),
+            "the refused run took a slot"
+        );
+        assert!(db.active_session(Some("alice")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_locked_deployment_refuses_a_run_pinned_to_another_profile() {
+        let temp = TempDb::new();
+        let mut state = gated_state(Arc::new(temp.reopen()));
+        let providers = crate::models::providers_from_config(crate::models::Config {
+            cloud_key: Some("test-key".into()),
+            cloud_models: "grok-4, grok-3".into(),
+            ..crate::models::Config::default()
+        })
+        .unwrap();
+        let mut models =
+            crate::models::Models::new(&reqwest::Client::new(), providers, None, None, false, None);
+        models.lock_to("cloud:grok-4").unwrap();
+        state.models = Arc::new(models);
+
+        let (status, bytes) = post_as_alice(state, Some("cloud:grok-3")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = serde_json::from_slice::<Value>(&bytes).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("cloud:grok-3"), "{error}");
+        assert!(error.contains("cloud:grok-4"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_summary_call_counts_against_the_user() {
+        use crate::daily_limits::testing::{DAY, limits};
+
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        db.add_tokens("alice", DAY, 10).unwrap();
+        let tokens = limits(db, None, Some(10)).tokens_for("alice").unwrap();
+        let client = Client::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1".into(),
+            None,
+            "qwen".into(),
+            None,
+            false,
+            None,
+        );
+        let err = summarize_with_model(&client, vec![ChatMessage::user("old")], Some(&tokens))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), crate::daily_limits::TOKENS_USED_MESSAGE);
     }
 
     #[test]

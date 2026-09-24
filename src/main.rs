@@ -1,4 +1,5 @@
 mod auth;
+mod daily_limits;
 mod db;
 mod llm;
 mod memory;
@@ -25,6 +26,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::Auth;
+use crate::daily_limits::DailyLimits;
 use crate::db::Db;
 use crate::models::{ACTIVE_KEY, Models};
 use crate::run::{DEFAULT_MAX_MODEL_CALLS, DEFAULT_RUN_BUDGET_SECS, RunLimits};
@@ -35,6 +37,7 @@ use crate::tools::ToolCatalog;
 pub struct AppState {
     pub db: Arc<Db>,
     pub models: Arc<Models>,
+    pub daily_limits: Option<Arc<DailyLimits>>,
     pub catalog: Arc<ToolCatalog>,
     pub auth: Arc<Auth>,
     pub limits: RunLimits,
@@ -174,7 +177,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
-    let models = Models::new(
+    let mut models = Models::new(
         &http,
         providers,
         db.get_config(ACTIVE_KEY)?,
@@ -182,10 +185,31 @@ async fn main() -> Result<()> {
         thinking,
         spend_cap,
     );
-    let active = models.active_label();
+    if let Some(locked) = env_var(models::LOCKED_PROFILE_ENV) {
+        models.lock_to(&locked)?;
+        info!(
+            "every run uses {locked}, set by {}",
+            models::LOCKED_PROFILE_ENV
+        );
+    }
+    let default_label = models.default_label();
+    let daily_limits = DailyLimits::new(
+        db.clone(),
+        parse_optional(daily_limits::RUNS_ENV, env_var(daily_limits::RUNS_ENV))?,
+        parse_optional(daily_limits::TOKENS_ENV, env_var(daily_limits::TOKENS_ENV))?,
+    );
+    if daily_limits.is_some() && auth.unauthenticated() {
+        info!(
+            "{} and {} do not apply: with {} unset no run has a user to count against",
+            daily_limits::RUNS_ENV,
+            daily_limits::TOKENS_ENV,
+            auth::SECRET_ENV
+        );
+    }
     let state = AppState {
         db,
         models: Arc::new(models),
+        daily_limits,
         catalog: Arc::new(ToolCatalog::new(
             http,
             geolang_url.trim_end_matches('/').to_string(),
@@ -202,7 +226,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {host}:{port}"))?;
     info!(
-        "sibyl listening on {host}:{port}, active profile {active}, db {}",
+        "sibyl listening on {host}:{port}, default profile {default_label}, db {}",
         db_path.display()
     );
     axum::serve(listener, app).await?;
@@ -221,6 +245,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/messages", post(sessions::add_message))
         .route("/models", get(models::list))
         .route("/model", put(models::switch))
+        .route("/model/default", put(models::switch_default))
         .route("/model/cloud", put(models::configure))
         .route("/model/providers", put(models::upsert))
         .route("/model/providers/{id}", delete(models::remove))
@@ -248,6 +273,7 @@ pub mod testing {
         AppState {
             db,
             models: Arc::new(Models::new(&http, providers, None, None, false, None)),
+            daily_limits: None,
             catalog: Arc::new(ToolCatalog::new(
                 http,
                 "http://127.0.0.1:1".into(),

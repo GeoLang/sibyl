@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+- 2026-09-23: **each user picks their own model.** `PUT /model` took no
+  bearer and switched the one active profile for every user, so anyone could
+  move the whole deployment onto a slow or costly model. It now needs a
+  platform bearer when the gate is on and stores the choice against the
+  caller's `sub`. `PUT /model/default`, `admin` only, moves the default.
+  `GET /models` takes an optional bearer, reports the caller's profile as
+  `active`, and adds `default` and `locked`. A run without `profile` uses the
+  caller's choice while it is available, else the default.
+- 2026-09-23: **the model can be locked.** With `SIBYL_LOCKED_PROFILE` set,
+  every run uses that profile, a run pinning another one is a 400, and
+  `PUT /model` and `PUT /model/default` answer 409. Startup fails when the id
+  names no available profile.
+- 2026-09-23: **per-user daily limits.** `SIBYL_RUNS_PER_USER_PER_DAY` caps the
+  runs one platform user starts per UTC day, and a refused run ends its stream
+  with an `error` event and is not counted. `SIBYL_TOKENS_PER_USER_PER_DAY`
+  caps their prompt plus completion tokens, charged like the spend cap on
+  every model call of a run, the summary call included. Both totals are rows
+  in sibyl.db, so a restart keeps them. With the gate off neither applies.
 - 2026-09-23: **provider settings need the admin role.** `PUT /model/cloud`,
   `PUT /model/providers` and `DELETE /model/providers/{id}` accepted any
   platform user, so a viewer could point the shared cloud provider at their

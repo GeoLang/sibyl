@@ -89,13 +89,15 @@ impl DailyLimits {
 
     pub fn tokens_for(self: &Arc<Self>, subject: &str, admin: bool) -> Option<UserTokens> {
         let tokens_per_day = self.allowance(admin).tokens_per_day;
-        if tokens_per_day.is_none() && self.tokens_per_month.is_none() {
+        let tokens_per_month = if admin { None } else { self.tokens_per_month };
+        if tokens_per_day.is_none() && tokens_per_month.is_none() {
             return None;
         }
         Some(UserTokens {
             limits: self.clone(),
             subject: subject.to_string(),
             tokens_per_day,
+            tokens_per_month,
         })
     }
 }
@@ -110,6 +112,7 @@ pub struct UserTokens {
     limits: Arc<DailyLimits>,
     subject: String,
     tokens_per_day: Option<u64>,
+    tokens_per_month: Option<u64>,
 }
 
 impl UserTokens {
@@ -122,7 +125,7 @@ impl UserTokens {
         {
             bail!(TOKENS_USED_MESSAGE);
         }
-        if let Some(tokens_per_month) = self.limits.tokens_per_month
+        if let Some(tokens_per_month) = self.tokens_per_month
             && db.month_tokens(&self.subject, &(self.limits.month)())? >= tokens_per_month as i64
         {
             bail!(MONTHLY_TOKENS_USED_MESSAGE);
@@ -296,6 +299,31 @@ mod tests {
             .charge_estimate(10)
             .unwrap();
         assert_eq!(db.day_tokens("bob", DAY).unwrap(), 10);
+    }
+
+    #[test]
+    fn an_admin_past_the_monthly_total_is_still_charged() {
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        db.add_tokens("owner", DAY, 1_000_000).unwrap();
+        let limits = Arc::new(DailyLimits {
+            db: db.clone(),
+            users: Allowance::default(),
+            admins: Allowance {
+                runs_per_day: None,
+                tokens_per_day: Some(2_000_000),
+            },
+            tokens_per_month: Some(1_000_000),
+            day: || DAY.to_string(),
+            month: || super::testing::MONTH.to_string(),
+        });
+
+        limits
+            .tokens_for("owner", true)
+            .unwrap()
+            .charge_estimate(10)
+            .unwrap();
+        assert_eq!(db.day_tokens("owner", DAY).unwrap(), 1_000_010);
     }
 
     #[test]

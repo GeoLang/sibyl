@@ -10,9 +10,9 @@ All notable changes to this project will be documented in this file.
   accounts could spend the shared `SIBYL_MONTHLY_SPEND_LIMIT_USD` on daily
   allowances alone and stop chat for everyone until the next month.
   `SIBYL_TOKENS_PER_USER_PER_MONTH` caps one platform user's prompt plus
-  completion tokens per UTC calendar month, admins included, summed from the
-  daily totals in sibyl.db. Unset means no monthly cap, and with the gate off
-  it does not apply.
+  completion tokens per UTC calendar month, summed from the daily totals in
+  sibyl.db. It applies to users only: an `admin` bearer has no monthly cap.
+  Unset means no monthly cap, and with the gate off it does not apply.
 - 2026-09-24: **chat messages and history have a size limit.** `POST /runs`
   stored a `message` of up to 2 MB before any token check, and every model
   call read the whole history after the summary. A `message` or a

@@ -180,7 +180,7 @@ To serve the model from a remote box that also runs liquid, which manages a llam
    After=network-online.target
 
    [Service]
-   ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -L 172.17.0.1:18200:127.0.0.1:18200 aaron@hercules
+   ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -L 172.17.0.1:18200:127.0.0.1:18200 <user>@<remote-box>
    Restart=always
    RestartSec=3
 

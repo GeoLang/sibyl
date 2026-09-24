@@ -213,12 +213,17 @@ async fn main() -> Result<()> {
         )?
         .or(users.tokens_per_day),
     };
-    let daily_limits = DailyLimits::new(db.clone(), users, admins);
+    let tokens_per_month = parse_optional(
+        daily_limits::MONTHLY_TOKENS_ENV,
+        env_var(daily_limits::MONTHLY_TOKENS_ENV),
+    )?;
+    let daily_limits = DailyLimits::new(db.clone(), users, admins, tokens_per_month);
     if daily_limits.is_some() && auth.unauthenticated() {
         info!(
-            "{} and {} do not apply: with {} unset no run has a user to count against",
+            "{}, {} and {} do not apply: with {} unset no run has a user to count against",
             daily_limits::RUNS_ENV,
             daily_limits::TOKENS_ENV,
+            daily_limits::MONTHLY_TOKENS_ENV,
             auth::SECRET_ENV
         );
     }

@@ -10,9 +10,12 @@ pub const RUNS_ENV: &str = "SIBYL_RUNS_PER_USER_PER_DAY";
 pub const TOKENS_ENV: &str = "SIBYL_TOKENS_PER_USER_PER_DAY";
 pub const ADMIN_RUNS_ENV: &str = "SIBYL_RUNS_PER_ADMIN_PER_DAY";
 pub const ADMIN_TOKENS_ENV: &str = "SIBYL_TOKENS_PER_ADMIN_PER_DAY";
+pub const MONTHLY_TOKENS_ENV: &str = "SIBYL_TOKENS_PER_USER_PER_MONTH";
 
 pub const RUNS_USED_MESSAGE: &str = "You have used today's runs. Try again tomorrow.";
 pub const TOKENS_USED_MESSAGE: &str = "Today's model budget is used up. Try again tomorrow.";
+pub const MONTHLY_TOKENS_USED_MESSAGE: &str =
+    "You have used this month's model allowance. Try again next month.";
 
 fn current_day() -> String {
     let now = OffsetDateTime::now_utc();
@@ -22,6 +25,11 @@ fn current_day() -> String {
         u8::from(now.month()),
         now.day()
     )
+}
+
+fn current_month() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!("{:04}-{:02}", now.year(), u8::from(now.month()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -40,19 +48,28 @@ pub struct DailyLimits {
     db: Arc<Db>,
     users: Allowance,
     admins: Allowance,
+    tokens_per_month: Option<u64>,
     day: fn() -> String,
+    month: fn() -> String,
 }
 
 impl DailyLimits {
-    pub fn new(db: Arc<Db>, users: Allowance, admins: Allowance) -> Option<Arc<Self>> {
-        if users.is_unlimited() && admins.is_unlimited() {
+    pub fn new(
+        db: Arc<Db>,
+        users: Allowance,
+        admins: Allowance,
+        tokens_per_month: Option<u64>,
+    ) -> Option<Arc<Self>> {
+        if users.is_unlimited() && admins.is_unlimited() && tokens_per_month.is_none() {
             return None;
         }
         Some(Arc::new(Self {
             db,
             users,
             admins,
+            tokens_per_month,
             day: current_day,
+            month: current_month,
         }))
     }
 
@@ -71,7 +88,10 @@ impl DailyLimits {
     }
 
     pub fn tokens_for(self: &Arc<Self>, subject: &str, admin: bool) -> Option<UserTokens> {
-        let tokens_per_day = self.allowance(admin).tokens_per_day?;
+        let tokens_per_day = self.allowance(admin).tokens_per_day;
+        if tokens_per_day.is_none() && self.tokens_per_month.is_none() {
+            return None;
+        }
         Some(UserTokens {
             limits: self.clone(),
             subject: subject.to_string(),
@@ -89,18 +109,26 @@ pub struct TokenCharge {
 pub struct UserTokens {
     limits: Arc<DailyLimits>,
     subject: String,
-    tokens_per_day: u64,
+    tokens_per_day: Option<u64>,
 }
 
 impl UserTokens {
     // charged before the call so a call cut off by the client leaving still counts
     pub fn charge_estimate(&self, estimated_input_tokens: u64) -> Result<TokenCharge> {
+        let db = &self.limits.db;
         let day = (self.limits.day)();
-        if self.limits.db.day_tokens(&self.subject, &day)? >= self.tokens_per_day as i64 {
+        if let Some(tokens_per_day) = self.tokens_per_day
+            && db.day_tokens(&self.subject, &day)? >= tokens_per_day as i64
+        {
             bail!(TOKENS_USED_MESSAGE);
         }
+        if let Some(tokens_per_month) = self.limits.tokens_per_month
+            && db.month_tokens(&self.subject, &(self.limits.month)())? >= tokens_per_month as i64
+        {
+            bail!(MONTHLY_TOKENS_USED_MESSAGE);
+        }
         let tokens = estimated_input_tokens as i64;
-        self.limits.db.add_tokens(&self.subject, &day, tokens)?;
+        db.add_tokens(&self.subject, &day, tokens)?;
         Ok(TokenCharge { day, tokens })
     }
 
@@ -117,6 +145,7 @@ pub mod testing {
     use super::*;
 
     pub const DAY: &str = "2026-09-23";
+    pub const MONTH: &str = "2026-09";
 
     pub fn limits(
         db: Arc<Db>,
@@ -135,14 +164,27 @@ pub mod testing {
             db,
             users,
             admins,
+            tokens_per_month: None,
             day: || DAY.to_string(),
+            month: || MONTH.to_string(),
+        })
+    }
+
+    pub fn monthly_limits(db: Arc<Db>, tokens_per_month: u64) -> Arc<DailyLimits> {
+        Arc::new(DailyLimits {
+            db,
+            users: Allowance::default(),
+            admins: Allowance::default(),
+            tokens_per_month: Some(tokens_per_month),
+            day: || DAY.to_string(),
+            month: || MONTH.to_string(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{DAY, limits, tiered_limits};
+    use super::testing::{DAY, limits, monthly_limits, tiered_limits};
     use super::*;
     use crate::db::testing::TempDb;
 
@@ -150,12 +192,12 @@ mod tests {
     fn no_limit_set_means_no_limits_at_all() {
         let temp = TempDb::new();
         let unlimited = Allowance::default();
-        assert!(DailyLimits::new(Arc::new(temp.reopen()), unlimited, unlimited).is_none());
+        assert!(DailyLimits::new(Arc::new(temp.reopen()), unlimited, unlimited, None).is_none());
         let runs_only = Allowance {
             runs_per_day: Some(40),
             tokens_per_day: None,
         };
-        let limits = DailyLimits::new(Arc::new(temp.reopen()), runs_only, runs_only).unwrap();
+        let limits = DailyLimits::new(Arc::new(temp.reopen()), runs_only, runs_only, None).unwrap();
         assert!(limits.tokens_for("alice", false).is_none());
     }
 
@@ -229,6 +271,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), TOKENS_USED_MESSAGE);
         assert_eq!(db.day_tokens("alice", DAY).unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn a_used_up_month_refuses_that_user_and_not_another() {
+        let temp = TempDb::new();
+        let db = Arc::new(temp.reopen());
+        db.add_tokens("alice", "2026-09-01", 600_000).unwrap();
+        db.add_tokens("alice", DAY, 400_000).unwrap();
+        db.add_tokens("bob", "2026-08-31", 1_000_000).unwrap();
+        let limits = monthly_limits(db.clone(), 1_000_000);
+
+        let err = limits
+            .tokens_for("alice", false)
+            .unwrap()
+            .charge_estimate(10)
+            .unwrap_err();
+        assert_eq!(err.to_string(), MONTHLY_TOKENS_USED_MESSAGE);
+        assert_eq!(db.day_tokens("alice", DAY).unwrap(), 400_000);
+
+        limits
+            .tokens_for("bob", false)
+            .unwrap()
+            .charge_estimate(10)
+            .unwrap();
+        assert_eq!(db.day_tokens("bob", DAY).unwrap(), 10);
     }
 
     #[test]

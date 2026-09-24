@@ -450,6 +450,16 @@ impl Db {
         Ok(tokens.unwrap_or(0))
     }
 
+    pub fn month_tokens(&self, subject: &str, month: &str) -> Result<i64> {
+        let tokens = self.conn().query_row(
+            "SELECT COALESCE(SUM(tokens), 0) FROM daily_usage
+             WHERE subject = ?1 AND day LIKE ?2 || '-%'",
+            params![subject, month],
+            |row| row.get(0),
+        )?;
+        Ok(tokens)
+    }
+
     pub fn add_tokens(&self, subject: &str, day: &str, tokens: i64) -> Result<()> {
         self.conn().execute(
             "INSERT INTO daily_usage (subject, day, tokens) VALUES (?1, ?2, ?3)
